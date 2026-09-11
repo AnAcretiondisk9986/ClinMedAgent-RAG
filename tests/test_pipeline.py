@@ -16,6 +16,13 @@ import fitz
 from medical_rag import pipeline
 from medical_rag.tasks import TaskManager
 
+ROOT = Path(__file__).resolve().parent.parent
+TOOLS_DIR = ROOT / "tools"
+# 流水线脚本已移到 tools/，它们之间是平级导入（如 tools_structure_v3 导入
+# tools_structure_v2），因此测试里必须把该目录加入 sys.path
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
 
 def make_pdf(path: Path, pages: int = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +141,7 @@ class CommandTests(unittest.TestCase):
     def test_ocr_force_adds_reset_and_uses_ocr_python(self) -> None:
         command = pipeline.stage_command(self.context, "ocr")
         self.assertEqual(command[0], "ocr-python")
-        self.assertIn("tools_ocr_v3.py", command[1])
+        self.assertEqual(command[1], str(pipeline.TOOLS_DIR / "tools_ocr_v3.py"))
         self.assertNotIn("--reset", command)
         self.assertIn("--reset", pipeline.stage_command(self.context, "ocr", force=True))
         self.assertIn("--reset", pipeline.stage_command(
@@ -341,7 +348,13 @@ class StructureStaleCleanupTests(unittest.TestCase):
     def _run(self, book_dir: Path, total_pages: int) -> None:
         import tools_structure_v3
 
-        argv = ["tools_structure_v3.py", "--book-dir", str(book_dir), "--total-pages", str(total_pages)]
+        argv = [
+            str(TOOLS_DIR / "tools_structure_v3.py"),
+            "--book-dir",
+            str(book_dir),
+            "--total-pages",
+            str(total_pages),
+        ]
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
             tools_structure_v3.main()
 

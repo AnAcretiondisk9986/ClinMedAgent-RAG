@@ -29,6 +29,11 @@ from .workspace import safe_dir_name
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_ROOT = DEFAULT_ROOT
+# 流水线脚本（OCR / 版面 / 表格 / 纠错 / 结构化）
+# 它们是独立子进程入口（且分属不同 venv），不是库代码，因此放在包外的 tools/
+TOOLS_DIR = PACKAGE_ROOT / "tools"
+# 构建产物与缓存统一收在 .build/ 下，根目录只留职责明确的目录
+BUILD_DIR_NAME = ".build"
 
 STAGES: list[tuple[str, str]] = [
     ("text", "文字层解析与结构化"),
@@ -228,7 +233,7 @@ def stage_command(ctx: PipelineContext, stage: str, force: bool = False) -> list
     if stage == "ocr":
         command = [
             ctx.ocr_python or ctx.python,
-            str(PACKAGE_ROOT / "tools_ocr_v3.py"),
+            str(TOOLS_DIR / "tools_ocr_v3.py"),
             str(ctx.pdf),
             str(ctx.text_dir),
             "--dpi",
@@ -240,7 +245,7 @@ def stage_command(ctx: PipelineContext, stage: str, force: bool = False) -> list
     if stage == "layout":
         return [
             ctx.paddle_python or ctx.python,
-            str(PACKAGE_ROOT / "tools_layout_v3.py"),
+            str(TOOLS_DIR / "tools_layout_v3.py"),
             str(ctx.pdf),
             str(ctx.text_dir / "layout.json"),
             "--dpi",
@@ -248,32 +253,32 @@ def stage_command(ctx: PipelineContext, stage: str, force: bool = False) -> list
             "--device",
             ctx.device,
             "--cache",
-            str(root / ".cache" / f"render_layout_{safe_dir_name(ctx.book_dir.name)}"),
+            str(root / BUILD_DIR_NAME / "cache" / f"render_layout_{safe_dir_name(ctx.book_dir.name)}"),
         ]
     if stage == "tables":
         return [
             ctx.paddle_python or ctx.python,
-            str(PACKAGE_ROOT / "tools_table_v3_gpu.py"),
+            str(TOOLS_DIR / "tools_table_v3_gpu.py"),
             str(ctx.pdf),
             str(ctx.text_dir),
             "--layout",
             str(ctx.text_dir / "layout.json"),
             "--cache",
-            str(root / ".cache" / f"render300_{safe_dir_name(ctx.book_dir.name)}"),
+            str(root / BUILD_DIR_NAME / "cache" / f"render300_{safe_dir_name(ctx.book_dir.name)}"),
             "--device",
             ctx.device,
         ]
     if stage == "fix":
         return [
             ctx.ocr_python or ctx.python,
-            str(PACKAGE_ROOT / "tools_fix_ocr_v3.py"),
+            str(TOOLS_DIR / "tools_fix_ocr_v3.py"),
             "--target",
             str(ctx.text_dir),
         ]
     if stage == "structure":
         command = [
             ctx.python,
-            str(PACKAGE_ROOT / "tools_structure_v3.py"),
+            str(TOOLS_DIR / "tools_structure_v3.py"),
             "--book-dir",
             str(ctx.book_dir),
         ]

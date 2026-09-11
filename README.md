@@ -1,4 +1,4 @@
-# 本地医学教材知识库（Codex 雏形）
+# ClinMedAgent-RAG —— 本地医学教材 RAG（引用优先）
 
 这是一个**本地、可追溯、面向多 Agent 平台**的医学教材检索层。当前已适配 Codex（MCP）与 pi（原生扩展 + Skill），底层不绑定某个 Agent：
 
@@ -10,17 +10,73 @@
 - **引用优先**：每个检索结果包含书名、页码、章节、原文和稳定 `chunk_id`；没有证据时工具返回空列表。
 - **本地优先**：PDF 不会被复制或上传，索引保存到项目下的 `.medical_rag/library.sqlite3`。
 
+## 安装
+
+需要 Python 3.10+（实测 3.14.3）。核心安装只依赖 PyMuPDF：
+
+```powershell
+git clone https://github.com/AnAcretiondisk9986/ClinMedAgent-RAG.git
+cd ClinMedAgent-RAG
+python -m venv .venv
+.venv\Scripts\pip install -e .          # 或 pip install -r requirements-core.txt
+medical-rag doctor                      # 环境自检（解释器 / 依赖 / 索引库 / 工作区）
+```
+
+OCR 与版面/表格是**可选流水线**，需要各自独立环境（原因见「环境与依赖」）：
+
+```powershell
+# OCR：纠错与结构化（Python 3.14 实测）
+python -m venv .venv-ocr
+.venv-ocr\Scripts\pip install -r requirements-core.txt -r requirements-ocr.txt
+
+# 版面 / 表格（Python 3.12，PaddlePaddle 的 GPU 轮子不覆盖 3.14）
+py -3.12 -m venv .venv-ocr312
+.venv-ocr312\Scripts\pip install -r requirements-core.txt -r requirements-paddle.txt
+```
+
+> 只做检索（不跑 OCR）时只需核心安装；`medical-rag doctor` 会把缺失的可选环境
+> 报为 **warn** 而不是 error，因此不会阻塞纯检索用法。
+
+## 项目结构
+
+根目录只保留职责明确的目录与配置；构建产物、缓存与本地数据都收在二级目录里：
+
+```
+ClinMedAgent-RAG/
+├── medical_rag/              核心包：检索库、题目分析、流水线、网站后端、MCP / bridge
+│   └── webui/                原生前端（无框架，随包分发）
+├── tools/                    OCR / 版面 / 表格 / 纠错 / 结构化脚本（独立子进程入口）
+├── tests/                    测试套件（pytest）
+├── scripts/                  启动脚本（start_web.bat 等）
+├── .pi/                      pi Agent 集成：extensions/ + skills/
+├── res/                      本地教材数据（PDF、text_v3、processed_v3）—— gitignored
+├── .medical_rag/             索引库与 PDF 分析缓存 —— gitignored
+├── .build/                   构建产物与缓存（渲染缓存、pytest 缓存）—— gitignored
+├── .venv-ocr/ .venv-ocr312/  可选流水线的独立环境 —— gitignored
+├── requirements-core.txt     核心依赖
+├── requirements-ocr.txt      OCR 流水线依赖（含 CUDA 组合说明）
+├── requirements-paddle.txt   版面/表格流水线依赖
+└── LICENSE  README.md  pyproject.toml
+```
+
+两个刻意的安排：
+
+- **`.pi/` 必须留在仓库根目录**：pi 代理按项目根发现 `.pi/extensions/` 与
+  `.pi/skills/`，移到二级目录会导致原生工具与 Skill 都加载不到。
+- **`tools/` 放在包外**：它们是独立子进程脚本、且分属不同虚拟环境，不是库代码，
+  因此不进入 `medical_rag` 包体（见 `pipeline.TOOLS_DIR`）。
+
 ## 当前状态
 
 已完成《系统解剖学 第5版》的 OCR 和**版面级结构化**：原书 356 页正文按 18 个章节、**校准后的原书页码**和 **939 个文本块**建立了索引。原始 PDF 是图片型 PDF，应使用 `ingest-text` 导入 `res\系统解剖学\processed_v3` 中的结构化 Markdown。
 
 结构化流水线（v3，2026-09 重建）：
 
-1. `tools_ocr_v3.py` 用 **rapidocr 3.9.2 + PP-OCRv6**（CUDA）以 300 DPI 逐页识别，导出每个文本框的坐标到 `res\系统解剖学\text_v3\boxes\`；全 368 页平均置信度 **0.977**。
-2. `tools_layout_v3.py` 用版面模型（PP-DocLayout）扫描全书，找出含表格的页（24 页），输出 `text_v3\layout.json`（表格框 + 每页渲染尺寸）。
-3. `tools_table_v3_gpu.py` **裁出表格区域后只跑表格管线**（`TableRecognitionPipelineV2`，关闭版面检测），显存占用约 1.3GB，24 个表格页约 22 秒；表格还原为带 `rowspan` 的 HTML。
-4. `tools_structure_v3.py` 基于坐标做版面重建：xy-cut 递归分栏、图内标签分离、段落重建、标题层级、页眉剔除、页脚页码校准；**表格框内的文本框会先从正文剔除**，再在页尾追加 HTML 表格，避免重复收录。
-5. `tools_fix_ocr_v3.py` 做定向纠错（`聘→腭`、`挠→桡`、`於→于`、`內→内` 等），只做本教材语境下不可能有歧义的替换。
+1. `tools/tools_ocr_v3.py` 用 **rapidocr 3.9.2 + PP-OCRv6**（CUDA）以 300 DPI 逐页识别，导出每个文本框的坐标到 `res\系统解剖学\text_v3\boxes\`；全 368 页平均置信度 **0.977**。
+2. `tools/tools_layout_v3.py` 用版面模型（PP-DocLayout）扫描全书，找出含表格的页（24 页），输出 `text_v3\layout.json`（表格框 + 每页渲染尺寸）。
+3. `tools/tools_table_v3_gpu.py` **裁出表格区域后只跑表格管线**（`TableRecognitionPipelineV2`，关闭版面检测），显存占用约 1.3GB，24 个表格页约 22 秒；表格还原为带 `rowspan` 的 HTML。
+4. `tools/tools_structure_v3.py` 基于坐标做版面重建：xy-cut 递归分栏、图内标签分离、段落重建、标题层级、页眉剔除、页脚页码校准；**表格框内的文本框会先从正文剔除**，再在页尾追加 HTML 表格，避免重复收录。
+5. `tools/tools_fix_ocr_v3.py` 做定向纠错（`聘→腭`、`挠→桡`、`於→于`、`內→内` 等），只做本教材语境下不可能有歧义的替换。
 6. **原书页码 = PDF 页 − 12**（347/348 个页脚页码检测点一致）。检索结果中的页码可直接对应纸质书。
 7. `ingest_markdown_tree` 把 `###`/`####` 标题写入证据的 section 元数据（如 `04-消化系统 · 三、腭`），并按标题对齐切块边界。
 
@@ -57,7 +113,7 @@ medical-rag doctor --repair        # 重建 FTS 索引，修复历史遗留的�
 `doctor` 有任何 error 项时退出码为 1，可直接用于脚本或 CI。网页端对应接口为
 `GET /api/health`（异常时返回 HTTP 503，需访问令牌）。
 
-已知局限：4 个空白页（PDF 4/12/166/252）无文字；表格单元格偶有错字，可用 `tools_fix_ocr_v3.py` 的词典继续补充；图形编号连字符、半角标点尚未统一。
+已知局限：4 个空白页（PDF 4/12/166/252）无文字；表格单元格偶有错字，可用 `tools/tools_fix_ocr_v3.py` 的词典继续补充；图形编号连字符、半角标点尚未统一。
 
 ## 命令行
 
@@ -100,7 +156,7 @@ python -m medical_rag.webapp            # 默认 http://127.0.0.1:17173（冷门
 python -m medical_rag.webapp --port 18080 --no-browser
 ```
 
-Windows 下也可以直接双击项目根目录的 `start_web.bat`：脚本会自动定位可用 Python（PATH 里的 `python` → `py -3` → 项目自带 `.venv-ocr`）并检查 PyMuPDF，缺依赖时给出中文提示；参数会原样透传，例如 `start_web.bat --port 18080`。
+Windows 下也可以直接双击 `scripts\start_web.bat`：脚本会自动定位可用 Python（PATH 里的 `python` → `py -3` → 项目自带 `.venv-ocr`）并检查 PyMuPDF，缺依赖时给出中文提示；参数会原样透传，例如 `scripts\start_web.bat --port 18080`。
 
 页面功能：
 
@@ -137,7 +193,7 @@ curl -H "X-Auth-Token: 你的令牌" http://192.168.1.10:17173/api/books
 
 即使用令牌，也不要把端口映射到公网。
 
-> 新版 `tools_structure_v3.py` 支持任意教材：`--book-dir res/生理学`，章节优先读 `<book-dir>/chapters.json`，没有就自动检测章标题（跳过目录页），检测不到则按单章输出。
+> 新版 `tools/tools_structure_v3.py` 支持任意教材：`--book-dir res/生理学`，章节优先读 `<book-dir>/chapters.json`，没有就自动检测章标题（跳过目录页），检测不到则按单章输出。
 
 ## 文字层 PDF（跳过 OCR）
 

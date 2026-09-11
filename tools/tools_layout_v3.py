@@ -4,7 +4,7 @@
 
 用法：
   .venv-ocr312/Scripts/python.exe tools_layout_v3.py <book.pdf> <out.json> \
-      [--dpi 300] [--device gpu] [--cache .cache/render]
+      [--dpi 300] [--device gpu] [--cache .build/cache/render]
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def main() -> None:
     ap.add_argument("out", type=Path)
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--device", default="gpu")
-    ap.add_argument("--cache", default=".cache/render")
+    ap.add_argument("--cache", default=".build/cache/render")
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--end", type=int, default=0)
     args = ap.parse_args()

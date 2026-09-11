@@ -1,6 +1,6 @@
 """结构化产物的暂存、原子替换与文件命名。
 
-背景问题：``pdftext.build_structured`` 与 ``tools_structure_v3`` 都直接往
+背景问题：``pdftext.build_structured`` 与 ``tools/tools_structure_v3`` 都直接往
 ``processed_v3/{cleaned,structured,quality.json}`` 写文件。如果这一次生成的章节
 比上一次少（章节合并、章标题识别结果变化、页数变化），旧章节 Markdown 不会被
 删除，重新建索引时过期内容仍会进入检索结果。

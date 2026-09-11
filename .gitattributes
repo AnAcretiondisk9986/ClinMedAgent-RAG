@@ -1,0 +1,16 @@
+# 换行统一：文本文件在仓库内一律存 LF，避免 Windows/Linux 协作产生整文件 diff
+* text=auto eol=lf
+
+# Windows 批处理必须保持 CRLF，否则 cmd.exe 解析 goto/label 等结构可能出错
+*.bat text eol=crlf
+
+# 二进制资源：不参与换行转换与文本 diff
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.onnx binary
+*.sqlite3 binary
+*.docx binary

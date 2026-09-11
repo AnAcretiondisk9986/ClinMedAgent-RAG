@@ -1,12 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "medical-book-rag"
-version = "0.2.0"
-description = "Local, citation-first medical book retrieval for agent platforms"
+name = "clinmedagent-rag"
+version = "0.3.0"
+description = "本地医学教材 RAG：引用优先的教材证据检索，面向 Agent 平台"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AnAcretiondisk9986" }]
+keywords = [
+  "rag", "retrieval", "medical", "textbook", "ocr",
+  "sqlite", "fts5", "mcp", "agent", "citation",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Education",
+  "Intended Audience :: Healthcare Industry",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+  "Topic :: Text Processing :: Indexing",
+]
+# 只声明核心依赖；OCR / 版面 / 表格是分属不同 Python 环境的可选流水线，
+# 版本矩阵见 README，安装用 requirements-ocr.txt / requirements-paddle.txt
+# （刻意不做成 pip extras：这些 GPU 轮子按 CUDA 版本匹配，写成 extras 会与实际不符）
 dependencies = ["PyMuPDF>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/AnAcretiondisk9986/ClinMedAgent-RAG"
+Repository = "https://github.com/AnAcretiondisk9986/ClinMedAgent-RAG"
+Issues = "https://github.com/AnAcretiondisk9986/ClinMedAgent-RAG/issues"
 
 [project.scripts]
 medical-rag = "medical_rag.cli:main"
 medical-rag-mcp = "medical_rag.mcp_server:main"
 medical-rag-bridge = "medical_rag.bridge:main"
 medical-rag-web = "medical_rag.webapp:main"
+
+[tool.setuptools]
+# tools/ 是独立子进程脚本（不是包），tests/ 不参与分发
+packages = ["medical_rag"]
+
+[tool.setuptools.package-data]
+medical_rag = ["webui/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+cache_dir = ".build/pytest_cache"

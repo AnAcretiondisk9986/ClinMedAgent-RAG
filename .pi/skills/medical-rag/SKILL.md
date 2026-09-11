@@ -89,20 +89,20 @@ python -m medical_rag.cli ingest-text res/系统解剖学/processed_v3 --title "
 
 ```bash
 # 1. 逐页识别：rapidocr 3.9.2 + PP-OCRv6（GPU）→ text_v3/{boxes,pages}
-.venv-ocr/Scripts/python.exe tools_ocr_v3.py "res/系统解剖学/PDF/系统解剖学 第5版.pdf" res/系统解剖学/text_v3
+.venv-ocr/Scripts/python.exe tools/tools_ocr_v3.py "res/系统解剖学/PDF/系统解剖学 第5版.pdf" res/系统解剖学/text_v3
 
 # 2. 版面检测：找出含表格的页 → text_v3/layout.json（含表格框与每页渲染尺寸）
-.venv-ocr312/Scripts/python.exe tools_layout_v3.py "res/系统解剖学/PDF/系统解剖学 第5版.pdf" res/系统解剖学/text_v3/layout.json --dpi 300 --device gpu
+.venv-ocr312/Scripts/python.exe tools/tools_layout_v3.py "res/系统解剖学/PDF/系统解剖学 第5版.pdf" res/系统解剖学/text_v3/layout.json --dpi 300 --device gpu
 
 # 3. 表格结构：裁出表格区域后只跑表格管线（8G 显存友好）→ text_v3/tables/
-.venv-ocr312/Scripts/python.exe tools_table_v3_gpu.py "res/系统解剖学/PDF/系统解剖学 第5版.pdf" res/系统解剖学/text_v3
+.venv-ocr312/Scripts/python.exe tools/tools_table_v3_gpu.py "res/系统解剖学/PDF/系统解剖学 第5版.pdf" res/系统解剖学/text_v3
 
 # 4. 结构化：正文 xy-cut + 表格页追加 HTML 表格 → processed_v3/
 #    默认处理 res/系统解剖学；其他教材用 --book-dir res/<书名>，章节读 <book-dir>/chapters.json，缺省自动检测
-.venv-ocr/Scripts/python.exe tools_structure_v3.py
+.venv-ocr/Scripts/python.exe tools/tools_structure_v3.py
 
 # 5.（可选）定向 OCR 纠错：聘→腭、挠→桡、於→于、內→内 等
-.venv-ocr/Scripts/python.exe tools_fix_ocr_v3.py
+.venv-ocr/Scripts/python.exe tools/tools_fix_ocr_v3.py
 
 # 6. 重建索引
 python -m medical_rag.cli ingest-text res/系统解剖学/processed_v3 --title "系统解剖学 第5版（OCR v3）"
@@ -121,7 +121,7 @@ python -m medical_rag.cli ingest-text res/组胚/processed_v3 --title "组织学
 
 输出目录与 OCR 流水线一致（`processed_v3/{cleaned,structured,quality.json}`），页码引用行为相同；检测结果按 PDF mtime 缓存在 `.medical_rag/pdf_text/`。旧式的纯文字 ingest（无章节与页码校准）仍可用：`python -m medical_rag.cli ingest "D:\医学教材\生理学.pdf"`。
 
-已知局限：4 个空白页（PDF 4/12/166/252）无文字；表格单元格偶有错字，可用 `tools_fix_ocr_v3.py` 的词典继续补充。
+已知局限：4 个空白页（PDF 4/12/166/252）无文字；表格单元格偶有错字，可用 `tools/tools_fix_ocr_v3.py` 的词典继续补充。
 
 ## 环境变量
 

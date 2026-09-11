@@ -67,7 +67,7 @@ def _correct_terms(value: str) -> str:
 
 
 # ---------------------------------------------------------------- 排序信号
-# 与 pdftext.RE_TOC_DOTS / tools_structure_v3.RE_TOC_DOTS 保持一致：
+# 与 pdftext.RE_TOC_DOTS / tools/tools_structure_v3.RE_TOC_DOTS 保持一致：
 # 中文目录引导符是……（两个 U+2026），不是三个点
 TOC_DOTS = re.compile(r"[…]{2,}|[.．·]{3,}")
 FIGURE_MARK = "[图注/图例]"

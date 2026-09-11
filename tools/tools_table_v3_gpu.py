@@ -82,7 +82,7 @@ def main() -> None:
     ap.add_argument("out", type=Path)
     ap.add_argument("--layout", default="res/系统解剖学/text_v3/layout.json")
     ap.add_argument("--page-dpi", type=int, default=300, help="layout 检测所用的 dpi")
-    ap.add_argument("--cache", default=".cache/render300")
+    ap.add_argument("--cache", default=".build/cache/render300")
     ap.add_argument("--pages", default=None, help="只用这些页（默认 layout 里所有表格页）")
     ap.add_argument("--ocr", default="mobile", choices=list(OCR_MODELS))
     ap.add_argument("--device", default="gpu")
