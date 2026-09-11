@@ -802,7 +802,12 @@ class Handler(BaseHTTPRequestHandler):
                     stream.write(chunk)
                     task.set_progress(written, length, f"{written / 1024 / 1024:.1f} / {length / 1024 / 1024:.1f} MB")
             # 字节收齐后先校验，再原子落盘：无效/截断的文件不能进书库
-            validate_pdf(temp, label=f"上传的 {filename}")
+            upload_info = validate_pdf(temp, label=f"上传的 {filename}")
+            if upload_info.get("repaired"):
+                task.log(
+                    "警告：上传的 PDF 已损坏，是经 PyMuPDF 修复后打开的；"
+                    "文字/页码可能不完整，建议核对后再处理"
+                )
             os.replace(temp, target)
         except InterruptedError:
             temp.unlink(missing_ok=True)

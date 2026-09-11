@@ -533,11 +533,14 @@ def validate_pdf(
                 raise ValueError(f"{label}共 {pages} 页，超过单本上限 {max_pages} 页")
             _check_page_geometry(doc, label)
             doc[pages - 1].get_text()  # 触发末页解析，暴露截断/损坏的 PDF
+            # 尾部截断等损坏文件 MuPDF 会“修复后”打开（is_repaired=True）。内容往往
+            # 可用，因此不直接拒绝，但必须回传标记让调用方提示用户，不能静默接受。
+            repaired = bool(getattr(doc, "is_repaired", False))
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - fitz 对损坏文件抛的异常类型不稳定
         raise ValueError(f"{label}不是有效的 PDF，或文件已损坏（{type(exc).__name__}: {exc}）") from exc
-    return {"pages": pages, "size": size}
+    return {"pages": pages, "size": size, "repaired": repaired}
 
 
 def _remove_empty(paths: list[Path]) -> None:
@@ -634,7 +637,12 @@ def import_pdf(
                 done += len(chunk)
                 task.set_progress(done, size, f"{_human_size(done)} / {_human_size(size)}")
         # 复制完成后再校验副本：磁盘写满/中途截断都会在这里被拦下
-        validate_pdf(temp, label=f"复制到 {target.name} 的文件")
+        copy_info = validate_pdf(temp, label=f"复制到 {target.name} 的文件")
+        if copy_info.get("repaired"):
+            task.log(
+                "警告：该 PDF 已损坏，是经 PyMuPDF 修复后打开的；"
+                "文字/页码可能不完整，建议核对后再入库"
+            )
         os.replace(temp, target)
     except BaseException as exc:
         temp.unlink(missing_ok=True)
