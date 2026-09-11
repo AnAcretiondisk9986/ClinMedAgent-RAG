@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import fitz
 
@@ -292,9 +294,16 @@ class UploadFailureTests(unittest.TestCase):
 
 
 class ConcurrentProcessTests(unittest.TestCase):
-    """两个**独立进程**同时重建同一本教材的索引。"""
+    """多个**独立进程**同时首次打开并重建同一个索引库。
 
-    def test_two_processes_rebuild_same_index(self) -> None:
+    这里刻意用 4 个进程：新库从默认日志模式切到 WAL 需要短暂独占锁，且该锁不受
+    busy_timeout 保护，两三个进程偶尔能通过、四个才稳定暴露问题（曾实测复现
+    “database is locked”）。
+    """
+
+    PROCESSES = 4
+
+    def test_concurrent_processes_rebuild_same_index(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="medrag_procs_"))
         book_dir = tmp / "res" / "并发教材"
         structured = book_dir / "processed_v3" / "structured"
@@ -321,10 +330,10 @@ class ConcurrentProcessTests(unittest.TestCase):
                 encoding="utf-8",
                 errors="replace",
             )
-            for _ in range(2)
+            for _ in range(self.PROCESSES)
         ]
         for proc in procs:
-            out, err = proc.communicate(timeout=180)
+            out, err = proc.communicate(timeout=300)
             self.assertEqual(proc.returncode, 0, err)
             self.assertIn("OK", out)
 
@@ -335,8 +344,80 @@ class ConcurrentProcessTests(unittest.TestCase):
             self.assertEqual(chunks, 1)  # 不重复插块
             self.assertTrue(library.fts_integrity_ok())  # 三套索引与 chunks 一致
             self.assertTrue(library.search("骨骼肌", 3))
+            self.assertEqual(library.journal_mode, "wal")
         finally:
             library.close()
+
+    def test_wal_setup_degrades_instead_of_raising(self) -> None:
+        """切 WAL 失败时只能降级，不能让构造 Library 直接抛异常。
+
+        sqlite3.Connection 是 C 扩展类型，没法用 mock.patch.object 打补丁（不允许
+        设置属性），因此用一个可注入失败的假连接——反而能把重试逻辑测得最清楚。
+        """
+        from medical_rag.library import _enable_wal
+
+        self.assertEqual(_enable_wal(_FlakyConnection(fail_times=99), attempts=1), "unknown")
+
+    def test_wal_setup_retries_then_succeeds(self) -> None:
+        """第一次读取就撞锁时，退避重试应能看到已被其他进程切好的 WAL。"""
+        from medical_rag.library import _enable_wal
+
+        connection = _FlakyConnection(fail_times=1, mode="wal")
+        self.assertEqual(_enable_wal(connection, attempts=3), "wal")
+        self.assertGreaterEqual(connection.calls, 2)
+
+    def test_wal_is_not_rewritten_when_already_enabled(self) -> None:
+        """库已是 WAL 时不应再去取独占锁（这正是多进程撞锁的根源）。"""
+        from medical_rag.library import _enable_wal
+
+        connection = _FlakyConnection(fail_times=0, mode="wal")
+        self.assertEqual(_enable_wal(connection), "wal")
+        self.assertEqual(connection.calls, 1)  # 只读一次，未执行切换
+
+    def test_wal_switch_is_attempted_for_non_wal_database(self) -> None:
+        from medical_rag.library import _enable_wal
+
+        connection = _FlakyConnection(fail_times=0, mode="delete")
+        self.assertEqual(_enable_wal(connection), "delete")
+        self.assertGreaterEqual(connection.calls, 3)  # 读 → 切换 → 再读确认
+
+    def test_wal_setup_works_on_real_connection(self) -> None:
+        """用一个真连接校对假连接没偏离真实行为。"""
+        from medical_rag.library import _enable_wal
+
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_wal_real_"))
+        connection = sqlite3.connect(tmp / "probe.sqlite3")
+        try:
+            self.assertEqual(_enable_wal(connection), "wal")
+            # 已经是 WAL：再调一次不应重新执行切换
+            self.assertEqual(_enable_wal(connection), "wal")
+        finally:
+            connection.close()
+
+
+class _Row:
+    """够用的假 cursor：_enable_wal 只需要 fetchone()。"""
+
+    def __init__(self, values):
+        self._values = values
+
+    def fetchone(self):
+        return self._values
+
+
+class _FlakyConnection:
+    """前 ``fail_times`` 次 execute 抛 database is locked，之后返回固定模式。"""
+
+    def __init__(self, fail_times: int = 0, mode: str = "delete"):
+        self.fail_times = fail_times
+        self.mode = mode
+        self.calls = 0
+
+    def execute(self, sql, *args):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise sqlite3.OperationalError("database is locked")
+        return _Row((self.mode,))
 
 
 class StaleContentEndToEndTests(unittest.TestCase):

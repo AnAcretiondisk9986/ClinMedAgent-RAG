@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,6 +160,35 @@ class IngestReport:
         )
 
 
+def _enable_wal(connection: sqlite3.Connection, attempts: int = 6) -> str:
+    """尽量把连接切到 WAL；失败则**降级**为当前日志模式，不抛异常。
+
+    把库从默认日志模式切成 WAL 需要短暂独占锁，而且这个锁不受 busy_timeout
+    保护：两个进程同时首次打开同一个新库时会有一个撞 ``database is locked``
+    （实测在“两个进程同时重建索引”场景下复现）。
+
+    因此做法是：先读当前模式（读不需要独占锁），已经是 WAL 就直接返回——WAL
+    是写进库头的持久属性，后续进程无需重复设置；确实需要切换时带退避重试，
+    重试期间也许已被另一个进程切好。WAL 只是并发优化，不是正确性前提，
+    所以最坏情况降级返回当前模式而不影响可用性。
+    """
+    for attempt in range(attempts):
+        try:
+            mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if mode == "wal":
+                return mode
+            connection.execute("PRAGMA journal_mode = WAL")
+            return str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        except sqlite3.OperationalError:
+            if attempt == attempts - 1:
+                break
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    except sqlite3.Error:
+        return "unknown"
+
+
 class Library:
     """Local multi-book evidence library."""
 
@@ -177,9 +207,9 @@ class Library:
         )
         self.cx = sqlite3.connect(self.db, timeout=30.0)
         self.cx.row_factory = sqlite3.Row
-        # WAL：重建索引的大写事务进行期间读者不被阻塞；busy_timeout：并发写自动串行化
+        # 并发写靠 busy_timeout 串行化；WAL 让重建索引期间读者不被阻塞
         self.cx.execute("PRAGMA busy_timeout = 30000")
-        self.cx.execute("PRAGMA journal_mode = WAL")
+        self.journal_mode = _enable_wal(self.cx)
         self.cx.execute("PRAGMA synchronous = NORMAL")
         self._init_schema()
 
