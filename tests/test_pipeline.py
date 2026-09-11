@@ -253,6 +253,18 @@ class ImportPdfTests(unittest.TestCase):
             pipeline.validate_pdf(self.source, max_pages=1)
         self.assertIn("上限", str(ctx.exception))
 
+    def test_validate_pdf_rejects_decompression_bomb(self) -> None:
+        """522 字节的 PDF 声明 20000×20000 pt 页面（300 DPI 需 ~20.8 GB），必须拒绝。"""
+        bomb = self.tmp / "src" / "炸弹.pdf"
+        doc = fitz.open()
+        doc.new_page(width=20000, height=20000)
+        doc.save(str(bomb))
+        doc.close()
+        self.assertLess(bomb.stat().st_size, 4096)  # 确实是很小的文件
+        with self.assertRaises(ValueError) as ctx:
+            pipeline.validate_pdf(bomb)
+        self.assertIn("尺寸异常", str(ctx.exception))
+
     def test_import_invalid_pdf_fails_and_leaves_no_trace(self) -> None:
         """无效 PDF：抛错、不落盘、不留 .part，且清掉刚建的空目录。"""
         bad = self.tmp / "src" / "坏教材.pdf"

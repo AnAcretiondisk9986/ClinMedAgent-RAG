@@ -58,8 +58,14 @@ DEFAULT_PORT = 17173  # 冷门端口，避开 8000/8080/5000 等常用端口
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 DEFAULT_ROOT = PACKAGE_ROOT
 MAX_JSON_BODY = 8 * 1024 * 1024
+# 单次上传的字节上限（可用 MEDICAL_RAG_MAX_UPLOAD 覆盖，单位字节）
+MAX_UPLOAD_SIZE = int(os.environ.get("MEDICAL_RAG_MAX_UPLOAD") or 2 * 1024 * 1024 * 1024)
 COPY_CHUNK = 1024 * 1024
 PDF_CHUNK = 1024 * 1024
+
+
+class UploadTooLarge(ValueError):
+    """上传体积超过 MAX_UPLOAD_SIZE（与控制流里的普通 ValueError 区分状态码）。"""
 
 
 def safe_file_name(name: str, fallback: str = "教材.pdf") -> str:
@@ -497,7 +503,9 @@ class Handler(BaseHTTPRequestHandler):
         task = self.app.tasks.create_manual(
             "import",
             f"导入《{title}》",
-            meta={"kind": "upload", "filename": filename, "title": title, "lock_key": lock_key},
+            # 注意用 book_key 而不是 lock_key：pending 状态不算已持锁，否则用户
+            # 放弃上传后残留的任务会永久阻塞这本教材
+            meta={"kind": "upload", "filename": filename, "title": title, "book_key": lock_key},
         )
         self._send_data(
             {
@@ -647,17 +655,27 @@ class Handler(BaseHTTPRequestHandler):
         if task.status != "pending":
             self._drain_body()
             return self._send_error_json(409, "该上传任务已经开始或结束")
+        # 先卡体积再占锁/读流：超大文件不进落盘路径，也不占用教材锁
+        if self.headers.get("Transfer-Encoding", "").lower().strip() == "chunked":
+            task.mark_error("不支持 chunked 传输编码")
+            self.close_connection = True
+            return self._send_error_json(411, "请提供 Content-Length（暂不支持 chunked 传输编码）")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return self._send_error_json(411, "缺少 Content-Length 或文件为空")
+        if length > MAX_UPLOAD_SIZE:
+            task.mark_error(f"文件 {length} 字节超过上限 {MAX_UPLOAD_SIZE} 字节")
+            self.close_connection = True
+            return self._send_error_json(
+                413, f"文件超过上限（{MAX_UPLOAD_SIZE / 1024 / 1024:.0f} MB）"
+            )
         # 真正开始写书库前才占锁，避免放弃上传后残留 pending 任务永久阻塞这本教材
-        lock_key = str(task.meta.get("lock_key") or "")
+        lock_key = str(task.meta.get("book_key") or "")
         if not self.app.tasks.acquire_lock(task, lock_key):
             return self._send_conflict(
                 self.app.tasks.active_for(lock_key) or task,
                 "这本教材已有任务在运行，请等它结束",
             )
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return self._send_error_json(411, "缺少 Content-Length 或文件为空")
-
         filename = str(task.meta.get("filename") or "教材.pdf")
         title = str(task.meta.get("title") or Path(filename).stem)
         book_dir = self.app.root / "res" / safe_dir_name(title)
@@ -681,8 +699,13 @@ class Handler(BaseHTTPRequestHandler):
                     chunk = self.rfile.read(min(COPY_CHUNK, length - written))
                     if not chunk:
                         raise IOError("上传中断：客户端提前断开")
-                    stream.write(chunk)
                     written += len(chunk)
+                    # 累计上限（防御 chunked/长度头不一致的情况）
+                    if written > MAX_UPLOAD_SIZE:
+                        raise UploadTooLarge(
+                            f"上传超过上限（{MAX_UPLOAD_SIZE / 1024 / 1024:.0f} MB）"
+                        )
+                    stream.write(chunk)
                     task.set_progress(written, length, f"{written / 1024 / 1024:.1f} / {length / 1024 / 1024:.1f} MB")
             # 字节收齐后先校验，再原子落盘：无效/截断的文件不能进书库
             validate_pdf(temp, label=f"上传的 {filename}")
@@ -691,6 +714,11 @@ class Handler(BaseHTTPRequestHandler):
             temp.unlink(missing_ok=True)
             task.mark_cancelled()
             return self._send_error_json(400, "上传已取消")
+        except UploadTooLarge as exc:
+            temp.unlink(missing_ok=True)
+            task.mark_error(str(exc))
+            self.close_connection = True
+            return self._send_error_json(413, str(exc))
         except ValueError as exc:
             temp.unlink(missing_ok=True)
             task.mark_error(str(exc))

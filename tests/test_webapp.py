@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -274,6 +275,60 @@ class ImportTests(WebAppTestCase):
             (self.tmp / "res" / "旧客户端教材" / "PDF" / "旧客户端.pdf").exists()
         )
 
+    def test_upload_over_limit_is_rejected(self) -> None:
+        """超过 MAX_UPLOAD_SIZE 立即 413：不落盘、不留 .part、任务标 error。"""
+        status, payload = self.json_data(
+            "/api/import/begin", "POST", {"filename": "大.pdf", "title": "大教材"}
+        )
+        self.assertEqual(status, 200)
+        begin = payload["data"]
+        with mock.patch.object(webapp_module, "MAX_UPLOAD_SIZE", 1024):
+            status, _, body = self.request(
+                begin["upload_url"],
+                "PUT",
+                raw=b"x" * 4096,
+                headers={"Content-Type": "application/pdf"},
+            )
+        self.assertEqual(status, 413, body)
+        self.assertEqual(self.wait_task(begin["task_id"])["status"], "error")
+        pdf_dir = self.tmp / "res" / "大教材" / "PDF"
+        self.assertFalse((pdf_dir / "大.pdf").exists())
+        self.assertEqual(list(pdf_dir.glob("*.part")), [])
+
+    def test_upload_without_content_length_is_rejected(self) -> None:
+        status, payload = self.json_data(
+            "/api/import/begin", "POST", {"filename": "空.pdf", "title": "空教材"}
+        )
+        self.assertEqual(status, 200)
+        status, _, body = self.request(
+            payload["data"]["upload_url"],
+            "PUT",
+            raw=b"",
+            headers={"Content-Type": "application/pdf"},
+        )
+        self.assertEqual(status, 411, body)
+
+    def test_chunked_upload_is_rejected(self) -> None:
+        """chunked 传输没有总体积上限，直接拒绝（要求 Content-Length）。"""
+        status, payload = self.json_data(
+            "/api/import/begin", "POST", {"filename": "分块.pdf", "title": "分块教材"}
+        )
+        self.assertEqual(status, 200)
+        url = payload["data"]["upload_url"]
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(
+                (
+                    f"PUT {url} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{self.port}\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Content-Type: application/pdf\r\n"
+                    "\r\n"
+                    "5\r\nhello\r\n0\r\n\r\n"
+                ).encode("ascii")
+            )
+            response = sock.recv(8192).decode("utf-8", "replace")
+        self.assertIn("411", response.split("\r\n")[0])
+
     def test_streamed_upload(self) -> None:
         status, payload = self.json_data(
             "/api/import/begin", "POST", {"filename": "上传教材.pdf", "title": "上传教材"}
@@ -399,6 +454,16 @@ class BookConcurrencyTests(WebAppTestCase):
         second_id = self._start_process(ids[1])
         self.assertNotEqual(first_id, second_id)
         self.release.set()
+
+    def test_abandoned_upload_does_not_block_book(self) -> None:
+        """只登记上传、不实际上传：pending 任务不应占用教材锁。"""
+        status, _ = self.json_data(
+            "/api/import/begin",
+            "POST",
+            {"filename": "测试教材.pdf", "title": "测试教材"},
+        )
+        self.assertEqual(status, 200)
+        self._start_process(self.book_id())  # 不应被 pending 上传任务阻塞
 
     def test_upload_is_rejected_while_process_runs(self) -> None:
         book_id = self.book_id()

@@ -476,6 +476,25 @@ def run_book_pipeline(
 
 PDF_MAGIC = b"%PDF-"
 MAX_PDF_PAGES = 6000  # 单本教材页数上限，防止压缩炸弹/误传超大文件
+MAX_PAGE_SIDE_PT = 14_400.0  # 200 英寸；单边超过即视为异常/恶意尺寸
+MAX_PAGE_AREA_PT = 40_000_000.0  # 约 80 倍 A4；300 DPI 渲染即需数十 GB 内存
+
+
+def _check_page_geometry(doc: "fitz.Document", label: str) -> None:
+    """拦截“解压炸弹”式 PDF：文件很小，但页面尺寸异常巨大。
+
+    render_page_png / OCR / 版面检测都会按 DPI 把页面渲染成位图。实测一个 522
+    字节、声明 20000×20000 pt 页面的 PDF，在 300 DPI 下需要约 20.8 GB RGB 内存，
+    足以在预览或 OCR 阶段直接耗尽内存。
+    """
+    for index, page in enumerate(doc, start=1):
+        rect = page.rect
+        side = max(rect.width, rect.height)
+        if side > MAX_PAGE_SIDE_PT or rect.width * rect.height > MAX_PAGE_AREA_PT:
+            raise ValueError(
+                f"{label}第 {index} 页尺寸异常（{rect.width:.0f}×{rect.height:.0f} pt），"
+                "疑似损坏或恶意构造的 PDF"
+            )
 
 
 def validate_pdf(
@@ -512,6 +531,7 @@ def validate_pdf(
                 raise ValueError(f"{label}没有任何页面（0 页）")
             if max_pages is not None and pages > max_pages:
                 raise ValueError(f"{label}共 {pages} 页，超过单本上限 {max_pages} 页")
+            _check_page_geometry(doc, label)
             doc[pages - 1].get_text()  # 触发末页解析，暴露截断/损坏的 PDF
     except ValueError:
         raise
