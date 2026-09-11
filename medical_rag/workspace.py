@@ -193,6 +193,20 @@ def book_state(
     text_kind = text_info.get("kind") if text_info else None
     workflow = "text" if text_kind == "text" else "ocr"
 
+    # 索引时效性：只比对 mtime + size（廉价）；sha256 强校验交给 doctor/Library
+    stale = False
+    stale_reason = ""
+    if indexed:
+        if db_book.get("source_mtime") is None:
+            stale, stale_reason = True, "索引缺少来源指纹（旧版本建立），建议重建索引"
+        elif pdf_info.get("mtime") is None:
+            stale, stale_reason = True, "源 PDF 不可读，无法确认索引是否过期"
+        elif (
+            abs(float(db_book["source_mtime"]) - float(pdf_info["mtime"])) > 1e-6
+            or int(db_book.get("source_size") or -1) != int(pdf_info.get("size") or -2)
+        ):
+            stale, stale_reason = True, "源 PDF 已变化，索引可能过期"
+
     status = {
         "workflow": workflow,
         "pdf": pdf_info,
@@ -234,6 +248,10 @@ def book_state(
             "chunk_pages": db_book.get("chunk_pages", 0) if db_book else 0,
             "path": db_book["path"] if db_book else None,
             "complete": indexed,
+            "stale": stale,
+            "stale_reason": stale_reason,
+            "indexed_at": db_book.get("indexed_at") if db_book else None,
+            "pipeline_version": db_book.get("pipeline_version") if db_book else None,
         },
     }
 

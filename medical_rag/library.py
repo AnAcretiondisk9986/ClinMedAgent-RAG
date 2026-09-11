@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import fitz
 
@@ -16,6 +17,22 @@ from .qa import match_book, plan_question, strip_book_mention
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
+
+# books 表的来源指纹：用于判断"PDF 已替换但索引还是旧的"。
+# 旧版本建的库没有这些列，_migrate_books() 会幂等补齐。
+SCHEMA_VERSION = 2
+BOOK_FINGERPRINT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("source_path", "TEXT"),
+    ("source_sha256", "TEXT"),
+    ("source_mtime", "REAL"),
+    ("source_size", "INTEGER"),
+    ("content_hash", "TEXT"),
+    ("pipeline_version", "TEXT"),
+    ("indexed_at", "TEXT"),
+    ("page_offset", "INTEGER"),
+    ("quality_path", "TEXT"),
+)
+FINGERPRINT_FIELDS: tuple[str, ...] = tuple(name for name, _ in BOOK_FINGERPRINT_COLUMNS)
 
 
 def _tokens(value: str) -> list[str]:
@@ -82,8 +99,11 @@ class Library:
             self.cx.close()
 
     def _init_schema(self) -> None:
+        extra_columns = "".join(
+            f",\n                {name} {kind}" for name, kind in BOOK_FINGERPRINT_COLUMNS
+        )
         self.cx.executescript(
-            """
+            f"""
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS books (
                 id INTEGER PRIMARY KEY,
@@ -92,7 +112,7 @@ class Library:
                 pages INTEGER NOT NULL,
                 extractable_pages INTEGER NOT NULL DEFAULT 0,
                 image_only_pages INTEGER NOT NULL DEFAULT 0,
-                added_at TEXT NOT NULL
+                added_at TEXT NOT NULL{extra_columns}
             );
             CREATE TABLE IF NOT EXISTS chunks (
                 rowid INTEGER PRIMARY KEY,
@@ -108,7 +128,119 @@ class Library:
             );
             """
         )
+        self._migrate_books()
+        self.cx.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.cx.commit()
+
+    def _migrate_books(self) -> None:
+        """老库幂等补齐来源指纹列（不重建表，不丢数据）。"""
+        existing = {row["name"] for row in self.cx.execute("PRAGMA table_info(books)")}
+        for name, kind in BOOK_FINGERPRINT_COLUMNS:
+            if name not in existing:
+                self.cx.execute(f"ALTER TABLE books ADD COLUMN {name} {kind}")
+
+    def _upsert_book(
+        self,
+        book_id: int | None,
+        title: str,
+        content_path: str,
+        pages: int,
+        extractable: int,
+        image_only: int,
+        fingerprint: dict[str, Any],
+        now: str,
+    ) -> int:
+        """写入 / 更新 books 行，并一并写入来源指纹。"""
+        # indexed_at 不在 fingerprint 里（由本次写入时间统一决定），必须显式补上，
+        # 否则 FINGERPRINT_FIELDS 里的 indexed_at 会写进 NULL
+        values = {**fingerprint, "indexed_at": now}
+        fingerprint_values = [values.get(name) for name in FINGERPRINT_FIELDS]
+        if book_id is not None:
+            assignments = ", ".join(
+                ["title=?", "pages=?", "extractable_pages=?", "image_only_pages=?", "added_at=?"]
+                + [f"{name}=?" for name in FINGERPRINT_FIELDS]
+            )
+            self.cx.execute(
+                f"UPDATE books SET {assignments} WHERE id=?",
+                (title, pages, extractable, image_only, now, *fingerprint_values, book_id),
+            )
+            return int(book_id)
+        columns = [
+            "title", "path", "pages", "extractable_pages", "image_only_pages", "added_at",
+            *FINGERPRINT_FIELDS,
+        ]
+        self.cx.execute(
+            f"INSERT INTO books({', '.join(columns)}) VALUES({', '.join('?' for _ in columns)})",
+            (title, content_path, pages, extractable, image_only, now, *fingerprint_values),
+        )
+        return int(self.cx.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    @staticmethod
+    def _file_sha256(path: Path, block: int = 1024 * 1024) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(block)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _source_fingerprint(self, text_root: Path, files: list[Path]) -> dict[str, Any]:
+        """来源指纹：PDF 的路径/hash/mtime/大小 + 结构化内容 hash + 质量元数据。
+
+        只在**建索引时**计算（包含一次 PDF 全文件 sha256），扫描/查询路径只用
+        mtime+size 做廉价比对，避免每次列书库都重算几百 MB 的哈希。
+        """
+        from .workspace import find_pdf  # 延迟导入：workspace 反向依赖 library
+
+        fingerprint: dict[str, Any] = {
+            "source_path": None,
+            "source_sha256": None,
+            "source_mtime": None,
+            "source_size": None,
+            "content_hash": None,
+            "pipeline_version": None,
+            "page_offset": None,
+            "quality_path": None,
+        }
+        book_dir = text_root.parent
+        pdf = find_pdf(book_dir) if book_dir.is_dir() else None
+        if pdf is not None:
+            fingerprint["source_path"] = str(pdf)
+            try:
+                stat = pdf.stat()
+                fingerprint["source_mtime"] = float(stat.st_mtime)
+                fingerprint["source_size"] = int(stat.st_size)
+                fingerprint["source_sha256"] = self._file_sha256(pdf)
+            except OSError:
+                pass
+
+        digest = hashlib.sha256()
+        for path in files:
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\x00")
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+            digest.update(b"\x01")
+        fingerprint["content_hash"] = digest.hexdigest()
+
+        quality_path = text_root / "quality.json"
+        if quality_path.exists():
+            fingerprint["quality_path"] = str(quality_path)
+            try:
+                quality = json.loads(quality_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                quality = None
+            if isinstance(quality, dict):
+                if quality.get("pipeline"):
+                    fingerprint["pipeline_version"] = str(quality["pipeline"])[:200]
+                offset = quality.get("page_offset")
+                if isinstance(offset, int):
+                    fingerprint["page_offset"] = offset
+        return fingerprint
 
     def _delete_book_chunks(self, book_id: int) -> None:
         """删除某本书的全部块，并同步维护 FTS 索引。
@@ -183,19 +315,30 @@ class Library:
         doc.close()
 
         existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(path),)).fetchone()
-        if existing:
-            book_id = existing[0]
+        book_id = existing[0] if existing else None
+        if book_id is not None:
             self._delete_book_chunks(book_id)
-            self.cx.execute(
-                "UPDATE books SET title=?, pages=?, extractable_pages=?, image_only_pages=?, added_at=? WHERE id=?",
-                (title, pages, extractable, image_only, datetime.now(timezone.utc).isoformat(), book_id),
-            )
-        else:
-            cur = self.cx.execute(
-                "INSERT INTO books(title,path,pages,extractable_pages,image_only_pages,added_at) VALUES(?,?,?,?,?,?)",
-                (title, str(path), pages, extractable, image_only, datetime.now(timezone.utc).isoformat()),
-            )
-            book_id = cur.lastrowid
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            stat = path.stat()
+            source_mtime, source_size = float(stat.st_mtime), int(stat.st_size)
+        except OSError:
+            source_mtime, source_size = None, None
+        source_sha256 = self._file_sha256(path)
+        fingerprint = {
+            "source_path": str(path),
+            "source_sha256": source_sha256,
+            "source_mtime": source_mtime,
+            "source_size": source_size,
+            # 直接从 PDF 抽文本时，内容 = 源文件，两者哈希等同
+            "content_hash": source_sha256,
+            "pipeline_version": "pdf-text（PyMuPDF 逐页抽取）",
+            "page_offset": None,
+            "quality_path": None,
+        }
+        book_id = self._upsert_book(
+            book_id, title, str(path), pages, extractable, image_only, fingerprint, now
+        )
 
         for ordinal, (page, section, text) in enumerate(page_chunks):
             digest = hashlib.sha1(f"{path}:{page}:{ordinal}:{text}".encode("utf-8")).hexdigest()[:20]
@@ -221,13 +364,14 @@ class Library:
         # 整本重建在一个写事务里完成：中途失败不会留下半套索引，并发重建在此串行化
         self.cx.execute("BEGIN IMMEDIATE")
         existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(root),)).fetchone()
-        if existing:
-            book_id = existing[0]
+        book_id = existing[0] if existing else None
+        if book_id is not None:
             self._delete_book_chunks(book_id)
-            self.cx.execute("UPDATE books SET title=?, pages=?, extractable_pages=?, image_only_pages=?, added_at=? WHERE id=?", (title, len(files), len(files), 0, datetime.now(timezone.utc).isoformat(), book_id))
-        else:
-            cur = self.cx.execute("INSERT INTO books(title,path,pages,extractable_pages,image_only_pages,added_at) VALUES(?,?,?,?,?,?)", (title, str(root), len(files), len(files), 0, datetime.now(timezone.utc).isoformat()))
-            book_id = cur.lastrowid
+        now = datetime.now(timezone.utc).isoformat()
+        fingerprint = self._source_fingerprint(root, files)
+        book_id = self._upsert_book(
+            book_id, title, str(root), len(files), len(files), 0, fingerprint, now
+        )
         count = 0
         max_source_page = 0
         for file in files:
@@ -266,6 +410,81 @@ class Library:
         self.cx.execute("UPDATE books SET pages=?, extractable_pages=?, image_only_pages=0 WHERE id=?", (page_count, page_count, book_id))
         self.cx.commit()
         return IngestReport(title, str(root), page_count, page_count, 0, count, str(self.db))
+
+    def book_freshness(self, book_id: int) -> dict[str, Any]:
+        """判断索引是否落后于源 PDF（识别“PDF 已替换但仍显示旧索引”）。
+
+        刻意只比对 mtime + size：对几百 MB 的扫描件每次列书库都重算 sha256 太慢。
+        需要强校验时用 :meth:`verify_source_hash`。
+        """
+        row = self.cx.execute("SELECT * FROM books WHERE id = ?", (int(book_id),)).fetchone()
+        if row is None:
+            return {"known": False, "book_id": int(book_id)}
+        data = dict(row)
+        info: dict[str, Any] = {
+            "known": True,
+            "book_id": int(book_id),
+            "title": data.get("title"),
+            "source_path": data.get("source_path"),
+            "source_mtime": data.get("source_mtime"),
+            "source_size": data.get("source_size"),
+            "content_hash": data.get("content_hash"),
+            "pipeline_version": data.get("pipeline_version"),
+            "indexed_at": data.get("indexed_at"),
+            "page_offset": data.get("page_offset"),
+            "quality_path": data.get("quality_path"),
+            "has_fingerprint": data.get("content_hash") is not None,
+            "stale": False,
+            "reason": "",
+        }
+        if not info["has_fingerprint"]:
+            info.update(stale=True, reason="索引没有来源指纹（旧版本建立），建议重建索引")
+            return info
+        source = data.get("source_path")
+        if not source or not Path(source).exists():
+            info.update(stale=True, reason=f"源 PDF 不存在：{source}")
+            return info
+        try:
+            stat = Path(source).stat()
+        except OSError as exc:
+            info.update(stale=True, reason=f"源 PDF 不可读：{exc}")
+            return info
+        mtime_changed = data.get("source_mtime") is None or abs(
+            float(data["source_mtime"]) - stat.st_mtime
+        ) > 1e-6
+        size_changed = data.get("source_size") is None or int(data["source_size"]) != stat.st_size
+        if mtime_changed or size_changed:
+            info.update(stale=True, reason="源 PDF 已变化（mtime/大小不同），索引可能过期")
+        return info
+
+    def verify_source_hash(self, book_id: int) -> dict[str, Any]:
+        """强校验：重算源 PDF 的 sha256 并与索引记录比对（慢，按需调用）。"""
+        info = self.book_freshness(book_id)
+        if not info.get("known") or not info.get("source_path"):
+            return {**info, "hash_matches": False}
+        stored = info.get("source_sha256") or self.cx.execute(
+            "SELECT source_sha256 FROM books WHERE id = ?", (int(book_id),)
+        ).fetchone()[0]
+        try:
+            current = self._file_sha256(Path(info["source_path"]))
+        except OSError as exc:
+            return {**info, "hash_matches": False, "reason": f"无法读取源 PDF：{exc}"}
+        matches = bool(stored) and stored == current
+        return {
+            **info,
+            "hash_matches": matches,
+            "source_sha256": current,
+            "stale": info["stale"] or not matches,
+            "reason": info["reason"] or ("" if matches else "源 PDF 内容已变化（sha256 不同）"),
+        }
+
+    def stale_books(self) -> list[dict[str, Any]]:
+        """返回索引可能过期的教材（供 doctor / 网页提示）。"""
+        return [
+            info
+            for info in (self.book_freshness(row["id"]) for row in self.list_books())
+            if info.get("stale")
+        ]
 
     def list_books(self) -> list[dict]:
         return [dict(row) for row in self.cx.execute("SELECT * FROM books ORDER BY title")]

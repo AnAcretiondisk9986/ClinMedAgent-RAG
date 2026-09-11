@@ -165,12 +165,16 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
         books = library.list_books()
         chunks = int(library.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         integrity = library.fts_integrity_ok()
+        stale = library.stale_books()
         report = {
             "path": str(db_path),
             "exists": True,
             "books": len(books),
             "chunks": chunks,
             "fts_integrity": integrity,
+            "stale_books": [
+                {"title": item.get("title"), "reason": item.get("reason")} for item in stale
+            ],
             "titles": [book["title"] for book in books],
         }
     finally:
@@ -186,6 +190,12 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
             "ok" if integrity else "error",
             "一致" if integrity else "chunks 与 chunks_fts 不一致（历史版本遗留）",
             "" if integrity else "运行 medical-rag doctor --repair 或重建索引修复",
+        ),
+        _check(
+            "索引时效性",
+            "warn" if stale else "ok",
+            f"{len(stale)} 本教材的索引可能过期" if stale else "索引与源 PDF 一致",
+            "；".join(f"{item.get('title')}：{item.get('reason')}" for item in stale[:3]) if stale else "",
         ),
     ]
     return report, checks
