@@ -195,6 +195,48 @@ echo '{"action":"answer","question":"请简述骨的构造"}' | python -m medica
 
 扩展在别的目录运行时可用环境变量定位项目：`MEDICAL_RAG_ROOT`（包含 `medical_rag/` 的根目录）、`MEDICAL_RAG_PYTHON`（Python 解释器）、`MEDICAL_RAG_DB`（指定数据库）。
 
+### 环境变量一览
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MEDICAL_RAG_ROOT` | 自动定位 | 项目根目录（含 `medical_rag/`） |
+| `MEDICAL_RAG_DB` | `<root>/.medical_rag/library.sqlite3` | 索引库路径 |
+| `MEDICAL_RAG_PYTHON` | 当前解释器 | 主解释器（文字层解析、索引） |
+| `MEDICAL_RAG_OCR_PYTHON` | `.venv-ocr` | OCR / 纠错 / 结构化使用的解释器 |
+| `MEDICAL_RAG_PADDLE_PYTHON` | `.venv-ocr312` | 版面 / 表格使用的解释器 |
+| `MEDICAL_RAG_WEB_PORT` | `17173` | 网页默认端口 |
+| `MEDICAL_RAG_TOKEN` | 空 | 访问令牌；监听非本机地址时必填（缺省自动生成并打印） |
+| `MEDICAL_RAG_MAX_UPLOAD` | `2147483648`（2 GiB） | 单次上传字节上限 |
+| `MEDICAL_RAG_EMBEDDING` | `lexical` | 向量后端：`lexical` 或 `ollama:<模型>`；不可用时自动回退词法后端 |
+| `MEDICAL_RAG_RERANKER` | `feature` | 重排器；未知取值回退特征式重排 |
+| `MEDICAL_RAG_ALIASES` | `<root>/.medical_rag/aliases.json` | 教材缩写白名单文件（覆盖/追加内置项） |
+
+教材缩写默认识别 `系解`、`组胚` 等内置别名（见 `medical_rag/qa.py` 的 `DEFAULT_BOOK_ALIASES`）。
+自己新增的教材可以写一份 `aliases.json` 补充，避免缩写被当普通词而无法限定范围：
+
+```json
+{ "影像": ["医学影像学"], "口组": "口腔组织病理学" }
+```
+
+> 缩写只在作为独立引用时生效（`组胚里…`、`《组胚》`、`请问组胚…`）。
+> `生理功能`、`组织的分类` 这类普通医学词不会被当成书名，题干没点名教材时保持全库检索。
+
+### 检索实现与已知限制
+
+- 中文检索靠 `chunks_fts_ngram`（字符二元组 FTS5）。`chunks_fts` 用的 unicode61
+  会把一整段连续中文当成单个 token，因此**不能**用它做中文子串检索；
+- 排序信号包括：完整题干原样出现、相邻概念、概念集中度、章节/段落标题匹配，
+  并对目录页（点线引导）、图注、过短页眉降权；每条结果都带 `match_reason`；
+- `answer_question` 会做证据去重（完全相同或互为子串者只留一条）与同页限流（最多 2 条），
+  并对同书相邻页标注 `adjacent_pages`。**相邻页不会被合并成一条**：引用必须保留
+  具体页码才能校验，且 `context`（radius=1）已带回前后页内容；
+- 向量通道只对词法候选的前 200 条**重排**，不做独立全库召回——没有 ANN 索引
+  （sqlite-vec / faiss 属新依赖）时，独立向量扫描会让延迟回到线性增长；
+- 默认的 `lexical` 向量后端是**词法级**表示，不做同义词泛化（`心梗` 与 `心肌梗死`
+  仍不相似）。接真语义模型请实现 `medical_rag.embeddings.EmbeddingBackend` 并用
+  `MEDICAL_RAG_EMBEDDING` 选中；Ollama 需要以 `--embeddings` 启动并已 pull 一个
+  embedding 模型（如 `bge-m3`），否则会自动退回词法后端。
+
 ## 题目解答流程
 
 当前已增加题目分析层：
