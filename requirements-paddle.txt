@@ -1,0 +1,24 @@
+# 版面/表格流水线：text_v3/layout.json 与 text_v3/tables
+# （tools_layout_v3.py、tools_table_v3_gpu.py）
+#
+# 必须单独建环境（本项目实测 Python 3.12.10，目录 .venv-ocr312）：
+# PaddlePaddle 的 GPU 轮子不覆盖主环境使用的 Python 3.14，因此 OCR 环境与
+# 版面环境是两套解释器，由 pipeline.py 分别调用。
+#
+#   py -3.12 -m venv .venv-ocr312
+#   .venv-ocr312\Scripts\pip install -r requirements-core.txt -r requirements-paddle.txt
+#
+# GPU 说明：下面这组是本机实测可用的组合（paddle 自报 CUDA 12.9 / cuDNN 9.9.0，
+# GPU：NVIDIA RTX 5070 Laptop）。CUDA/cuDNN 不匹配时 paddle 会回退 CPU，
+# 版面与表格阶段会非常慢。用 --device cpu 可显式走 CPU。
+#
+#   python -c "import paddle; print(paddle.device.is_compiled_with_cuda(), paddle.version.cuda())"
+#
+# 版本矩阵见 README「环境与依赖」。
+paddlepaddle-gpu==3.2.2
+paddleocr==3.7.0
+paddlex==3.7.2
+numpy==2.3.5
+pillow==12.3.0
+shapely==2.1.2
+pyclipper==1.4.0

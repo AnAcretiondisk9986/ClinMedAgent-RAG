@@ -13,6 +13,7 @@
 
 API 概览：
     GET  /api/overview                 书库、任务、环境信息
+    GET  /api/health                   环境自检（同 medical-rag doctor，异常时 HTTP 503）
     GET  /api/books                    教材列表
     GET  /api/books/<id>               教材详情（含章节、页范围）
     GET  /api/books/<id>/cover.png     封面（PDF 第一页）
@@ -50,9 +51,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .doctor import check_environment, interpreter_info
 from .library import Library
 from .pdftext import cached_analyze, kind_label, recommendation
-from .pipeline import PACKAGE_ROOT, run_book_pipeline, validate_pdf, venv_python
+from .pipeline import PACKAGE_ROOT, run_book_pipeline, validate_pdf
 from .tasks import Task, TaskManager
 from .workspace import WINDOWS_RESERVED_NAMES, safe_dir_name, scan_books
 
@@ -118,22 +120,6 @@ def book_lock_key(directory: Path | str) -> str:
     text_v3、processed_v3、SQLite 索引与缓存 PNG。
     """
     return os.path.normcase(str(Path(directory).resolve()))
-
-
-def interpreter_info(root: Path) -> dict[str, Any]:
-    ocr = os.environ.get("MEDICAL_RAG_OCR_PYTHON") or venv_python(root, "ocr") or sys.executable
-    paddle = (
-        os.environ.get("MEDICAL_RAG_PADDLE_PYTHON")
-        or venv_python(root, "ocr312")
-        or ocr
-    )
-    return {
-        "python": os.environ.get("MEDICAL_RAG_PYTHON") or sys.executable,
-        "ocr_python": ocr,
-        "paddle_python": paddle,
-        "venv_ocr": venv_python(root, "ocr") is not None,
-        "venv_ocr312": venv_python(root, "ocr312") is not None,
-    }
 
 
 def render_page_png(app: "WebApp", book: dict[str, Any], page_no: int, width: int) -> Path:
@@ -356,6 +342,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/overview":
                 port = getattr(self.server, "server_port", None)
                 return self._send_data(self._trim(self.app.overview(port)))
+            if path == "/api/health":
+                report = check_environment(self.app.root, self.app.db)
+                return self._send_data(self._trim(report), status=200 if report["ok"] else 503)
             if path == "/api/books":
                 return self._send_data(self._trim(self.app.books()))
             if path == "/api/tasks":

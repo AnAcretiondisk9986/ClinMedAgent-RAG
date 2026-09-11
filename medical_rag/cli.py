@@ -1,8 +1,28 @@
 from __future__ import annotations
 import argparse
+import json
 import sys
 from pathlib import Path
+from .doctor import check_environment, format_report, repair
 from .library import Library
+
+
+def _run_doctor(args: argparse.Namespace) -> None:
+    if args.repair:
+        result = repair(args.root, args.db)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif result.get("repaired"):
+            print(f"FTS 索引已重建：{result['chunks']} 个证据块，一致性检查通过。")
+        else:
+            print(f"未修复：{result.get('reason') or '重建后仍不一致'}")
+        raise SystemExit(0 if result.get("repaired") else 1)
+    report = check_environment(args.root, args.db, deep=args.deep)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_report(report))
+    raise SystemExit(0 if report["ok"] else 1)
 
 
 def main() -> None:
@@ -25,8 +45,25 @@ def main() -> None:
     it.add_argument("directory", type=Path)
     it.add_argument("--title")
     sub.add_parser("list", help="列出已导入书籍")
+    doctor = sub.add_parser("doctor", help="环境自检（解释器、依赖、索引库、工作区）")
+    doctor.add_argument("--root", type=Path, help="项目根目录（默认自动定位）")
+    doctor.add_argument("--db", type=Path, help="library.sqlite3 路径")
+    doctor.add_argument("--deep", action="store_true", help="额外启动子解释器验证 OCR/Paddle 依赖可导入（较慢）")
+    doctor.add_argument("--repair", action="store_true", help="重建 FTS 索引，修复 chunks 与 chunks_fts 不一致")
+    doctor.add_argument("--json", action="store_true", help="以 JSON 输出")
     args = parser.parse_args()
+
+    if args.command == "doctor":
+        _run_doctor(args)
+
     library = Library()
+    try:
+        _dispatch(args, library)
+    finally:
+        library.close()
+
+
+def _dispatch(args: argparse.Namespace, library: Library) -> None:
     if args.command == "ingest":
         print(library.ingest(args.pdf, args.title))
     elif args.command == "search":
@@ -34,7 +71,6 @@ def main() -> None:
             score = f" · score={item['score']}" if item.get('score') is not None else ""
             print(f"[{item['book']} · 第{item['page']}页 · {item['section']}{score}]\n{item['text']}\nchunk_id={item['chunk_id']}\n")
     elif args.command == "answer":
-        import json
         result = library.answer_question(args.question, args.limit, book=getattr(args, "book", None))
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2))

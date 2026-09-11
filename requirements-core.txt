@@ -1,0 +1,7 @@
+# 核心依赖：CLI 检索、MCP、网页后端、文字层 PDF（pdftext）。
+# Python >= 3.10（实测 3.14.3 可用）。
+#
+#   pip install -r requirements-core.txt
+#
+# OCR 与版面/表格流水线需要额外环境，见 requirements-ocr.txt 与 requirements-paddle.txt。
+PyMuPDF>=1.24

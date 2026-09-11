@@ -1,0 +1,22 @@
+# OCR 流水线：text_v3/boxes（tools_ocr_v3.py、tools_fix_ocr_v3.py、tools_structure_v3.py）
+#
+# 独立环境（本项目实测 Python 3.14.3，目录 .venv-ocr）：
+#
+#   python -m venv .venv-ocr
+#   .venv-ocr\Scripts\pip install -r requirements-core.txt -r requirements-ocr.txt
+#
+# GPU 说明：onnxruntime-gpu 需要与本机 CUDA/cuDNN 匹配的版本；下面这组是本机
+# 实测可用的组合（GPU：NVIDIA RTX 5070 Laptop，驱动 596.49，
+# onnxruntime 报告 CUDAExecutionProvider 可用）。换机器时若 GPU provider
+# 不可用，可退回 CPU 版 onnxruntime（速度明显变慢，但流程一致）。
+#
+#   python -c "import onnxruntime as o; print(o.get_available_providers())"
+#
+# 版本矩阵见 README「环境与依赖」。
+rapidocr==3.9.2
+onnxruntime-gpu==1.26.0
+opencv-python==5.0.0.93
+numpy==2.5.3
+pillow==12.3.0
+shapely==2.1.2
+pyclipper==1.4.0

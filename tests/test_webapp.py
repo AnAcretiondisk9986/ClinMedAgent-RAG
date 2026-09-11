@@ -501,6 +501,24 @@ class BookConcurrencyTests(WebAppTestCase):
         self.release.set()
 
 
+class HealthTests(WebAppTestCase):
+    def test_health_returns_environment_report(self) -> None:
+        status, payload = self.json_data("/api/health")
+        self.assertIn(status, (200, 503))
+        data = payload["data"]
+        self.assertIn("checks", data)
+        self.assertIn("interpreters", data)
+        self.assertIn("database", data)
+        self.assertTrue(any(item["name"] == "Python 版本" for item in data["checks"]))
+
+    def test_health_does_not_create_database(self) -> None:
+        """健康检查是只读的，不能顺手把索引库建出来。"""
+        db = self.tmp / ".medical_rag" / "library.sqlite3"
+        self.assertFalse(db.exists())
+        self.json_data("/api/health")
+        self.assertFalse(db.exists())
+
+
 class ProcessTests(WebAppTestCase):
     def test_process_validates_book(self) -> None:
         status, payload = self.json_data("/api/process", "POST", {"book_id": "missing"})
@@ -633,6 +651,10 @@ class AuthTests(unittest.TestCase):
     def test_static_assets_need_no_token(self) -> None:
         status, _, _ = self.request("/static/app.js")
         self.assertEqual(status, 200)
+
+    def test_health_requires_token(self) -> None:
+        status, _, _ = self.request("/api/health")
+        self.assertEqual(status, 401)
 
 
 class LoopbackGuardTests(unittest.TestCase):

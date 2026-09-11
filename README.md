@@ -24,7 +24,38 @@
 6. **原书页码 = PDF 页 − 12**（347/348 个页脚页码检测点一致）。检索结果中的页码可直接对应纸质书。
 7. `ingest_markdown_tree` 把 `###`/`####` 标题写入证据的 section 元数据（如 `04-消化系统 · 三、腭`），并按标题对齐切块边界。
 
-环境：`.venv-ocr`（Python 3.14，识别）与 `.venv-ocr312`（Python 3.12，版面/表格，paddlepaddle-gpu）。
+### 环境与依赖
+
+流水线分两套解释器：OCR 需要 Python 3.14，而 PaddlePaddle 的 GPU 轮子不覆盖 3.14，
+所以版面/表格单独用 Python 3.12。两者都由 `pipeline.py` 按阶段分别调用，可用
+`MEDICAL_RAG_OCR_PYTHON` / `MEDICAL_RAG_PADDLE_PYTHON` 覆盖。
+
+| 用途 | 目录 | Python | 关键依赖（本项目实测可用版本） |
+| --- | --- | --- | --- |
+| 核心 / CLI / 网页 / 文字层 | 任意 | >= 3.10（实测 3.14.3） | `PyMuPDF 1.28.2` |
+| OCR、纠错、结构化 | `.venv-ocr` | 3.14.3 | `rapidocr 3.9.2`、`onnxruntime-gpu 1.26.0`（CUDA provider 可用）、`opencv-python 5.0.0.93`、`numpy 2.5.3`、`pillow 12.3.0`、`shapely 2.1.2`、`pyclipper 1.4.0` |
+| 版面 / 表格 | `.venv-ocr312` | 3.12.10 | `paddlepaddle-gpu 3.2.2`（自报 CUDA 12.9 / cuDNN 9.9.0）、`paddleocr 3.7.0`、`paddlex 3.7.2`、`numpy 2.3.5` |
+
+实测 GPU：NVIDIA RTX 5070 Laptop（驱动 596.49）。换机器后 CUDA/cuDNN 不匹配时
+paddle 会回退 CPU（版面与表格阶段会非常慢），可用 `--device cpu` 显式走 CPU；
+`onnxruntime-gpu` 可换成 CPU 版 `onnxruntime`。
+
+安装与自检：
+
+```powershell
+pip install -r requirements-core.txt                       # 核心
+python -m venv .venv-ocr
+.venv-ocr\Scripts\pip install -r requirements-core.txt -r requirements-ocr.txt
+py -3.12 -m venv .venv-ocr312
+.venv-ocr312\Scripts\pip install -r requirements-core.txt -r requirements-paddle.txt
+
+medical-rag doctor                 # 环境自检（解释器 / 依赖 / 索引库 / 工作区）
+medical-rag doctor --deep          # 额外启动子解释器验证依赖可导入
+medical-rag doctor --repair        # 重建 FTS 索引，修复历史遗留的一致性问题
+```
+
+`doctor` 有任何 error 项时退出码为 1，可直接用于脚本或 CI。网页端对应接口为
+`GET /api/health`（异常时返回 HTTP 503，需访问令牌）。
 
 已知局限：4 个空白页（PDF 4/12/166/252）无文字；表格单元格偶有错字，可用 `tools_fix_ocr_v3.py` 的词典继续补充；图形编号连字符、半角标点尚未统一。
 
