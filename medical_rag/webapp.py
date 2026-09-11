@@ -187,6 +187,9 @@ class WebApp:
         return Library(self.db)
 
     def overview(self, port: int | None = None) -> dict[str, Any]:
+        from .embeddings import create_backend_cached
+
+        backend, embedding_warning = create_backend_cached(os.environ.get("MEDICAL_RAG_EMBEDDING"))
         books = self.books()
         indexed = [book for book in books if book["status"]["index"]["complete"]]
         return {
@@ -195,6 +198,7 @@ class WebApp:
             "port": port,
             "time": time.time(),
             "interpreters": interpreter_info(self.root),
+            "embedding": {"backend": backend.name, "warning": embedding_warning},
             "books": books,
             "tasks": self.tasks.list(),
             "totals": {
@@ -486,8 +490,8 @@ class Handler(BaseHTTPRequestHandler):
             path = urllib.parse.unquote(parsed.path)
             parts = [segment for segment in path.split("/") if segment]
             if not self._authorized(urllib.parse.parse_qs(parsed.query)):
-                # 请求体未读，关闭连接避免 HTTP/1.1 流水线错位
-                self.close_connection = True
+                # 完整读掉 JSON 体再回复，避免客户端看到连接被重置（WinError 10053）
+                self._drain_body(MAX_JSON_BODY)
                 return self._send_error_json(401, AUTH_HINT)
             if path == "/api/import":
                 return self._post_import()
@@ -510,10 +514,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
-    def _drain_body(self) -> None:
+    def _drain_body(self, limit: int = COPY_CHUNK) -> bool:
+        """尽力读掉请求体，返回是否已读完。
+
+        拒绝请求（如 401）时如果不读走请求体就直接关连接，Windows 会因为接收
+        缓冲区里还有未读数据而发 RST，客户端拿到的是连接被中止而不是我们发的
+        状态码。所以体量小就完整读掉，体量超过 ``limit`` 才标记关闭连接。
+        """
         length = int(self.headers.get("Content-Length") or 0)
-        if 0 < length <= COPY_CHUNK:
-            self.rfile.read(length)
+        if length <= 0:
+            return True
+        if length > limit:
+            self.close_connection = True
+            return False
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(COPY_CHUNK, remaining))
+            if not chunk:
+                self.close_connection = True
+                return False
+            remaining -= len(chunk)
+        return True
 
     def _post_import(self) -> None:
         body = self._read_json()
@@ -709,7 +730,8 @@ class Handler(BaseHTTPRequestHandler):
             path = urllib.parse.unquote(parsed.path)
             parts = [segment for segment in path.split("/") if segment]
             if not self._authorized(urllib.parse.parse_qs(parsed.query)):
-                self.close_connection = True
+                # 上传体可能极大，只读出小量；超过上限则标记关闭连接
+                self._drain_body(COPY_CHUNK)
                 return self._send_error_json(401, AUTH_HINT)
             if parts[:3] == ["api", "import", "upload"] and len(parts) == 4:
                 return self._put_upload(parts[3])

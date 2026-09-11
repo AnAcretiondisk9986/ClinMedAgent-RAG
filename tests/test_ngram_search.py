@@ -47,12 +47,18 @@ def make_library(root: Path) -> Library:
 
 
 def force_full_scan(lib: Library):
-    """把 _candidate_rows 换成永远全表扫描，用于对比召回是否一致。"""
+    """把 _candidate_rows 换成永远全表扫描，用于对比召回是否一致。
+
+    必须与 _candidate_rows 的回退分支列集保持一致（含 vector），否则向量重排
+    只在一侧生效，对比就不再是“同样的打分、不同的候选集”。
+    """
 
     def rows(q: str, tokens: list[str], book_ids: set[int] | None = None):
         sql = (
             "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
-            "NULL AS norm_text FROM chunks c JOIN books b ON b.id=c.book_id"
+            "NULL AS norm_text, v.vector AS vector "
+            "FROM chunks c JOIN books b ON b.id=c.book_id "
+            "LEFT JOIN chunk_vectors v ON v.rowid = c.rowid"
         )
         if book_ids:
             placeholders = ",".join("?" for _ in book_ids)

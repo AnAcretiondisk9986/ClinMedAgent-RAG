@@ -172,6 +172,8 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
             "books": len(books),
             "chunks": chunks,
             "fts_integrity": integrity,
+            "embedding_backend": getattr(library, "embedding", None) and library.embedding.name,
+            "embedding_warning": getattr(library, "embedding_warning", ""),
             "stale_books": [
                 {"title": item.get("title"), "reason": item.get("reason")} for item in stale
             ],
@@ -190,6 +192,15 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
             "ok" if integrity else "error",
             "一致" if integrity else "chunks 与 chunks_fts 不一致（历史版本遗留）",
             "" if integrity else "运行 medical-rag doctor --repair 或重建索引修复",
+        ),
+        _check(
+            "向量后端",
+            "warn" if library.embedding_warning else "ok",
+            library.embedding.name
+            + (f"（{library.embedding_warning}）" if library.embedding_warning else ""),
+            ""
+            if not library.embedding_warning
+            else "语义后端不可用属正常：检索会自动退回词法后端，不影响可用性",
         ),
         _check(
             "索引时效性",

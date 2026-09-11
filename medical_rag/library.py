@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 import fitz
 
+from .embeddings import create_backend_cached, serialize
 from .outputs import is_internal_output
 from .qa import (
     CONFIDENCE_ORDER,
@@ -21,13 +22,14 @@ from .qa import (
     plan_question,
     strip_book_mention,
 )
+from .rerank import candidates_for_rerank, create_reranker
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
 
 # books 表的来源指纹：用于判断"PDF 已替换但索引还是旧的"。
 # 旧版本建的库没有这些列，_migrate_books() 会幂等补齐。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BOOK_FINGERPRINT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("source_path", "TEXT"),
     ("source_sha256", "TEXT"),
@@ -165,6 +167,14 @@ class Library:
         self.db.parent.mkdir(parents=True, exist_ok=True)
         # 教材缩写白名单（内置 + 可选的 aliases.json）
         self.aliases = load_book_aliases(self.db.parent)
+        # 向量后端：默认零依赖词法后端；语义后端不可用时自动回退（见 embeddings.py）
+        self.embedding, self.embedding_warning = create_backend_cached(
+            os.environ.get("MEDICAL_RAG_EMBEDDING")
+        )
+        # 重排器：默认特征式线性重排（见 rerank.py）
+        self.reranker, self.reranker_warning = create_reranker(
+            os.environ.get("MEDICAL_RAG_RERANKER")
+        )
         self.cx = sqlite3.connect(self.db, timeout=30.0)
         self.cx.row_factory = sqlite3.Row
         # WAL：重建索引的大写事务进行期间读者不被阻塞；busy_timeout：并发写自动串行化
@@ -217,10 +227,17 @@ class Library:
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_ngram USING fts5(
                 bigrams, norm_text
             );
+            -- 向量通道：稀疏向量（bucket:weight），backend 用于后端切换后失效重建
+            CREATE TABLE IF NOT EXISTS chunk_vectors (
+                rowid INTEGER PRIMARY KEY,
+                backend TEXT NOT NULL,
+                vector TEXT NOT NULL
+            );
             """
         )
         self._migrate_books()
         self._backfill_ngram_index()
+        self._backfill_vector_index()
         self.cx.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.cx.commit()
 
@@ -261,6 +278,39 @@ class Library:
         self.cx.execute("DELETE FROM chunks_fts_ngram")
         for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
             self._insert_ngram(row["rowid"], row["text"])
+
+    def _insert_vector(self, rowid: int, text: str) -> None:
+        vector = self.embedding.embed([_normalise(text)])[0]
+        self.cx.execute(
+            "INSERT INTO chunk_vectors(rowid, backend, vector) VALUES(?,?,?)",
+            (int(rowid), self.embedding.name, serialize(vector)),
+        )
+
+    def _vector_count(self) -> int:
+        return int(
+            self.cx.execute(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE backend = ?", (self.embedding.name,)
+            ).fetchone()[0]
+        )
+
+    def _backfill_vector_index(self) -> None:
+        """老库一次性回填向量索引（幂等）；换后端后也会自动重建。"""
+        chunks = int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        if not chunks:
+            return
+        if self._vector_count() >= chunks:
+            return
+        self.cx.execute("DELETE FROM chunk_vectors")
+        for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
+            self._insert_vector(row["rowid"], row["text"])
+
+    def rebuild_vector_index(self) -> int:
+        """重建向量索引（换嵌入后端或修复后调用）。"""
+        self.cx.execute("DELETE FROM chunk_vectors")
+        for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
+            self._insert_vector(row["rowid"], row["text"])
+        self.cx.commit()
+        return self._vector_count()
 
     def _upsert_book(
         self,
@@ -366,30 +416,38 @@ class Library:
         return fingerprint
 
     def _delete_book_chunks(self, book_id: int) -> None:
-        """删除某本书的全部块，并同步维护 FTS 索引。
+        """删除某本书的全部块，并同步维护三套索引。
 
         ``chunks_fts`` 是 external-content FTS5 表：``'delete'`` 命令必须带上
         原始列值（text/section），否则旧词条不会被移除。``chunks.rowid`` 会被
         复用，残留词条会让检索命中已经不存在的内容（幽灵结果），同时
         ``integrity-check`` 会报 ``database disk image is malformed``。
+
+        ``chunks_fts_ngram`` 与 ``chunk_vectors`` 都靠 ``rowid IN (SELECT ...
+        FROM chunks ...)`` 定位，**必须在删除 chunks 之前执行**，否则子查询为
+        空、旧行残留，重新索引时会撞 UNIQUE 约束或产生重复条目。
         """
         self.cx.execute(
             "INSERT INTO chunks_fts(chunks_fts, rowid, text, section) "
             "SELECT 'delete', rowid, text, section FROM chunks WHERE book_id = ?",
             (book_id,),
         )
-        # 二元组索引是独立 FTS5 表，按 rowid 直接删（必须在删 chunks 之前做）
         self.cx.execute(
             "DELETE FROM chunks_fts_ngram WHERE rowid IN (SELECT rowid FROM chunks WHERE book_id = ?)",
+            (book_id,),
+        )
+        self.cx.execute(
+            "DELETE FROM chunk_vectors WHERE rowid IN (SELECT rowid FROM chunks WHERE book_id = ?)",
             (book_id,),
         )
         self.cx.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
 
     def fts_integrity_ok(self) -> bool:
-        """检查两个 FTS 索引与 chunks 是否一致。
+        """检查三套索引与 chunks 是否一致。
 
         1) chunks_fts（external content）用 rank=1 逐行与 content 表核对；
-        2) chunks_fts_ngram（独立表）比对行数，少行意味着有块搜不到。
+        2) chunks_fts_ngram（独立 FTS5）比对行数；
+        3) chunk_vectors（普通表）比对行数，少行意味着有块参与不了向量重排。
         """
         try:
             self.cx.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)")
@@ -397,14 +455,16 @@ class Library:
             return False
         chunks = int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         indexed = int(self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0])
-        return indexed == chunks
+        return indexed == chunks and self._vector_count() == chunks
 
     def rebuild_fts_index(self) -> int:
-        """重建两个 FTS 索引（修复历史遗留的 chunks/chunks_fts 不一致）。"""
+        """重建三套索引（修复历史遗留的 chunks/chunks_fts 不一致）。"""
         self.cx.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
         self.cx.execute("DELETE FROM chunks_fts_ngram")
+        self.cx.execute("DELETE FROM chunk_vectors")
         for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
             self._insert_ngram(row["rowid"], row["text"])
+            self._insert_vector(row["rowid"], row["text"])
         self.cx.commit()
         return int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
 
@@ -488,6 +548,7 @@ class Library:
                 (cur.lastrowid, text, section),
             )
             self._insert_ngram(cur.lastrowid, text)
+            self._insert_vector(cur.lastrowid, text)
         self.cx.commit()
         return IngestReport(title, str(path), pages, extractable, image_only, len(page_chunks), str(self.db))
 
@@ -527,6 +588,7 @@ class Library:
                 cur2 = self.cx.execute("INSERT INTO chunks(chunk_id,book_id,page,section,text) VALUES(?,?,?,?,?)", (digest, book_id, page, section, text))
                 self.cx.execute("INSERT INTO chunks_fts(rowid,text,section) VALUES(?,?,?)", (cur2.lastrowid, text, section))
                 self._insert_ngram(cur2.lastrowid, text)
+                self._insert_vector(cur2.lastrowid, text)
                 count += 1; buffer = []
             for line in content.splitlines():
                 m = re.match(r"^## 原书第\s*(\d+)\s*页", line)
@@ -671,9 +733,11 @@ class Library:
             match = " OR ".join(f'"{gram}"' for gram in sorted(bigrams))
             sql = (
                 "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
-                "n.norm_text AS norm_text "
+                "n.norm_text AS norm_text, v.vector AS vector "
                 "FROM chunks_fts_ngram n JOIN chunks c ON c.rowid = n.rowid "
-                "JOIN books b ON b.id = c.book_id WHERE n.bigrams MATCH ?"
+                "JOIN books b ON b.id = c.book_id "
+                "LEFT JOIN chunk_vectors v ON v.rowid = c.rowid "
+                "WHERE n.bigrams MATCH ?"
             )
             params: list[Any] = [match]
             if book_ids:
@@ -684,7 +748,9 @@ class Library:
 
         sql = (
             "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
-            "NULL AS norm_text FROM chunks c JOIN books b ON b.id=c.book_id"
+            "NULL AS norm_text, v.vector AS vector "
+            "FROM chunks c JOIN books b ON b.id=c.book_id "
+            "LEFT JOIN chunk_vectors v ON v.rowid = c.rowid"
         )
         if book_ids:
             placeholders = ",".join("?" for _ in book_ids)
@@ -754,13 +820,17 @@ class Library:
                 continue
             item = dict(row)
             item.pop("norm_text", None)  # 内部缓存字段，不对外暴露
+            # 注意：vector 必须留到重排阶段再用，不能在这里 pop
             item["score"] = round(score, 4)
             item["match_reason"] = _match_reasons(
                 exact, phrase_hits, proximity, section_hits, heading_hit, matched, penalties
             )
             scored.append((score, item))
         scored.sort(key=lambda x: (-x[0], x[1]["page"], x[1]["chunk_id"]))
-        return [item for _, item in scored[:limit]]
+        # 向量通道只对词法候选做有界重排（见 rerank.py：不独立全库召回）
+        ranked = candidates_for_rerank(scored)
+        self.reranker.rerank(ranked, self.embedding.embed([q])[0])
+        return ranked[:limit]
 
     def _resolve_book_ids(self, book: int | str | None, books: list[dict] | None = None) -> set[int] | None:
         """把 book 参数解析成书籍 id 集合：支持 id、数字字符串、书名/缩写（如“组胚”）。
