@@ -51,7 +51,7 @@ from .library import Library
 from .pdftext import cached_analyze, kind_label, recommendation
 from .pipeline import PACKAGE_ROOT, run_book_pipeline, validate_pdf, venv_python
 from .tasks import Task, TaskManager
-from .workspace import safe_dir_name, scan_books
+from .workspace import WINDOWS_RESERVED_NAMES, safe_dir_name, scan_books
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17173  # 冷门端口，避开 8000/8080/5000 等常用端口
@@ -68,15 +68,32 @@ class UploadTooLarge(ValueError):
     """上传体积超过 MAX_UPLOAD_SIZE（与控制流里的普通 ValueError 区分状态码）。"""
 
 
+MAX_FILE_NAME = 120
+
+
 def safe_file_name(name: str, fallback: str = "教材.pdf") -> str:
-    """把上传文件名转成安全的单文件名，并保证 .pdf 后缀。"""
-    name = Path(str(name)).name
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().strip(".")
-    if not name:
-        name = fallback
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    return name[:120]
+    """把上传文件名转成安全的单文件名，并保证 .pdf 后缀。
+
+    三个必须避开的坑：
+      1. 去掉路径与非法字符，避免写到目标目录之外；
+      2. 截断时先保留扩展名、只截主体——否则超长文件名会被截成没有 .pdf 的
+         字符串，后续按后缀判断的逻辑全部失效；
+      3. Windows 保留设备名即使带扩展名（CON.pdf / NUL.pdf / COM1.pdf）也
+         无法创建，需要加下划线。
+    """
+    raw = Path(str(name)).name
+    raw = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw)
+    raw = re.sub(r"\s+", " ", raw).strip().strip(".")
+    if not raw:
+        return fallback
+
+    body = raw[:-4] if raw.lower().endswith(".pdf") else raw
+    body = body.strip().strip(".")
+    limit = max(1, MAX_FILE_NAME - len(".pdf"))
+    body = body[:limit].strip().rstrip(". ") or Path(fallback).stem or "教材"
+    if body.upper() in WINDOWS_RESERVED_NAMES:
+        body = f"{body}_"
+    return f"{body}.pdf"
 
 
 def book_lock_key(directory: Path | str) -> str:

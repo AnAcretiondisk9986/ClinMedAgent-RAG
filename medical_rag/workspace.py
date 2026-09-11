@@ -18,7 +18,9 @@ from .pdftext import cached_analyze
 
 PDF_PAGE_CACHE: dict[tuple[str, float], int] = {}
 _INVALID_DIR_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_WINDOWS_RESERVED = {
+# Windows 保留设备名：即使带扩展名（CON.pdf、NUL.pdf）也无法创建，目录名与
+# 文件名共用这一份定义，避免两处实现漂移
+WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
@@ -34,7 +36,7 @@ def safe_dir_name(title: str, fallback: str = "未命名教材") -> str:
     """把书名转成安全的目录名（Windows 兼容）。"""
     name = _INVALID_DIR_CHARS.sub("", str(title)).strip().strip(".")
     name = re.sub(r"\s+", " ", name)
-    if not name or name.upper() in _WINDOWS_RESERVED:
+    if not name or name.upper() in WINDOWS_RESERVED_NAMES:
         return fallback
     return name[:60]
 

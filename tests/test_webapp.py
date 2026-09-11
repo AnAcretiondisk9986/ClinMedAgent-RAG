@@ -15,7 +15,8 @@ import fitz
 
 from medical_rag import webapp as webapp_module
 from medical_rag.library import Library
-from medical_rag.webapp import create_server
+from medical_rag.webapp import MAX_FILE_NAME, create_server, safe_file_name
+from medical_rag.workspace import WINDOWS_RESERVED_NAMES
 
 
 def make_pdf(path: Path, pages: int = 3) -> None:
@@ -231,6 +232,27 @@ class SearchTests(WebAppTestCase):
 
 
 class ImportTests(WebAppTestCase):
+    def test_long_upload_filename_keeps_pdf_suffix(self) -> None:
+        """超长文件名截断后必须仍是 .pdf（否则后续按后缀判断全失效）。"""
+        long_name = "超长教材名" * 40 + ".pdf"
+        status, payload = self.json_data(
+            "/api/import/begin", "POST", {"filename": long_name, "title": "超长"}
+        )
+        self.assertEqual(status, 200)
+        source = self.tmp / "长.pdf"
+        make_pdf(source, pages=1)
+        status, _, body = self.request(
+            payload["data"]["upload_url"],
+            "PUT",
+            raw=source.read_bytes(),
+            headers={"Content-Type": "application/pdf"},
+        )
+        self.assertEqual(status, 200, body)
+        saved = list((self.tmp / "res" / "超长" / "PDF").glob("*.pdf"))
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0].name.endswith(".pdf"))
+        self.assertLessEqual(len(saved[0].name), MAX_FILE_NAME)
+
     def test_path_import_creates_copy(self) -> None:
         source = self.tmp / "外部教材.pdf"
         make_pdf(source, pages=2)
@@ -499,6 +521,40 @@ class ProcessTests(WebAppTestCase):
     def test_cancel_unknown_task(self) -> None:
         status, payload = self.json_data("/api/tasks/nope/cancel", "POST", {})
         self.assertEqual(status, 400)
+
+
+class SafeFileNameTests(unittest.TestCase):
+    """上传文件名净化：截断保留后缀、避开 Windows 保留名、去路径与非法字符。"""
+
+    def test_truncation_keeps_pdf_suffix(self) -> None:
+        name = safe_file_name("骨" * 300 + ".pdf")
+        self.assertTrue(name.endswith(".pdf"))
+        self.assertEqual(len(name), MAX_FILE_NAME)
+
+    def test_truncation_of_name_without_suffix(self) -> None:
+        name = safe_file_name("长" * 300)
+        self.assertTrue(name.endswith(".pdf"))
+        self.assertLessEqual(len(name), MAX_FILE_NAME)
+
+    def test_windows_reserved_names_are_escaped(self) -> None:
+        for raw in ("CON.pdf", "nul.PDF", "COM1.pdf", "LPT9.pdf", "aux"):
+            with self.subTest(raw=raw):
+                name = safe_file_name(raw)
+                self.assertTrue(name.endswith(".pdf"))
+                self.assertNotIn(name[: -len(".pdf")].upper(), WINDOWS_RESERVED_NAMES)
+
+    def test_strips_paths_and_illegal_characters(self) -> None:
+        self.assertEqual(safe_file_name("../../etc/骨:学.pdf"), "骨_学.pdf")
+        self.assertEqual(safe_file_name("C:\\windows\\系统.pdf"), "系统.pdf")
+
+    def test_empty_and_dot_names_fall_back(self) -> None:
+        for raw in ("", "...", "../", "   "):
+            with self.subTest(raw=raw):
+                self.assertEqual(safe_file_name(raw), "教材.pdf")
+
+    def test_trailing_dots_and_spaces_removed(self) -> None:
+        self.assertEqual(safe_file_name("骨学 ...pdf"), "骨学.pdf")
+        self.assertEqual(safe_file_name("骨学 .pdf"), "骨学.pdf")
 
 
 class StyleGuardTests(unittest.TestCase):
