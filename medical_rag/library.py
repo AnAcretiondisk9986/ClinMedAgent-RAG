@@ -27,7 +27,7 @@ DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
 
 # books 表的来源指纹：用于判断"PDF 已替换但索引还是旧的"。
 # 旧版本建的库没有这些列，_migrate_books() 会幂等补齐。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BOOK_FINGERPRINT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("source_path", "TEXT"),
     ("source_sha256", "TEXT"),
@@ -135,9 +135,17 @@ class Library:
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 text, section, content='chunks', content_rowid='rowid'
             );
+            -- 中文二元组索引：unicode61 会把一整段连续中文当成一个 token，
+            -- 所以 MATCH '"上皮组织"' 永远不会命中；切成字符二元组后每个二元组
+            -- 成为独立 token，中文子串检索才可用。norm_text 順便缓存规范化文本，
+            -- 避免每次检索都对全部候选重算 _normalise()。
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_ngram USING fts5(
+                bigrams, norm_text
+            );
             """
         )
         self._migrate_books()
+        self._backfill_ngram_index()
         self.cx.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.cx.commit()
 
@@ -147,6 +155,37 @@ class Library:
         for name, kind in BOOK_FINGERPRINT_COLUMNS:
             if name not in existing:
                 self.cx.execute(f"ALTER TABLE books ADD COLUMN {name} {kind}")
+
+    @staticmethod
+    def _bigram_text(normalized: str) -> str:
+        """把规范化文本切成字符二元组（空格分隔），供 FTS5 索引。"""
+        if len(normalized) < 2:
+            return normalized
+        return " ".join(normalized[i:i + 2] for i in range(len(normalized) - 1))
+
+    def _ngram_values(self, text: str) -> tuple[str, str]:
+        """返回 (二元组字符串, 规范化文本)。"""
+        normalized = _normalise(text)
+        return self._bigram_text(normalized), normalized
+
+    def _insert_ngram(self, rowid: int, text: str) -> None:
+        bigrams, normalized = self._ngram_values(text)
+        self.cx.execute(
+            "INSERT INTO chunks_fts_ngram(rowid, bigrams, norm_text) VALUES(?,?,?)",
+            (int(rowid), bigrams, normalized),
+        )
+
+    def _backfill_ngram_index(self) -> None:
+        """老库一次性回填二元组索引（幂等）；已齐则只做两次 COUNT。"""
+        chunks = int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        if not chunks:
+            return
+        indexed = int(self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0])
+        if indexed >= chunks:
+            return
+        self.cx.execute("DELETE FROM chunks_fts_ngram")
+        for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
+            self._insert_ngram(row["rowid"], row["text"])
 
     def _upsert_book(
         self,
@@ -264,19 +303,33 @@ class Library:
             "SELECT 'delete', rowid, text, section FROM chunks WHERE book_id = ?",
             (book_id,),
         )
+        # 二元组索引是独立 FTS5 表，按 rowid 直接删（必须在删 chunks 之前做）
+        self.cx.execute(
+            "DELETE FROM chunks_fts_ngram WHERE rowid IN (SELECT rowid FROM chunks WHERE book_id = ?)",
+            (book_id,),
+        )
         self.cx.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
 
     def fts_integrity_ok(self) -> bool:
-        """检查 chunks_fts 与 chunks 是否一致（rank=1 会逐行与 content 表核对）。"""
+        """检查两个 FTS 索引与 chunks 是否一致。
+
+        1) chunks_fts（external content）用 rank=1 逐行与 content 表核对；
+        2) chunks_fts_ngram（独立表）比对行数，少行意味着有块搜不到。
+        """
         try:
             self.cx.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)")
         except sqlite3.DatabaseError:
             return False
-        return True
+        chunks = int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        indexed = int(self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0])
+        return indexed == chunks
 
     def rebuild_fts_index(self) -> int:
-        """重建 FTS 索引，修复历史遗留的 chunks / chunks_fts 不一致。"""
+        """重建两个 FTS 索引（修复历史遗留的 chunks/chunks_fts 不一致）。"""
         self.cx.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        self.cx.execute("DELETE FROM chunks_fts_ngram")
+        for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
+            self._insert_ngram(row["rowid"], row["text"])
         self.cx.commit()
         return int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
 
@@ -359,6 +412,7 @@ class Library:
                 "INSERT INTO chunks_fts(rowid,text,section) VALUES(?,?,?)",
                 (cur.lastrowid, text, section),
             )
+            self._insert_ngram(cur.lastrowid, text)
         self.cx.commit()
         return IngestReport(title, str(path), pages, extractable, image_only, len(page_chunks), str(self.db))
 
@@ -397,6 +451,7 @@ class Library:
                 digest = hashlib.sha1(f"{root}:{file}:{page}:{count}:{text}".encode("utf-8")).hexdigest()[:20]
                 cur2 = self.cx.execute("INSERT INTO chunks(chunk_id,book_id,page,section,text) VALUES(?,?,?,?,?)", (digest, book_id, page, section, text))
                 self.cx.execute("INSERT INTO chunks_fts(rowid,text,section) VALUES(?,?,?)", (cur2.lastrowid, text, section))
+                self._insert_ngram(cur2.lastrowid, text)
                 count += 1; buffer = []
             for line in content.splitlines():
                 m = re.match(r"^## 原书第\s*(\d+)\s*页", line)
@@ -521,6 +576,48 @@ class Library:
             return None
         return int(row["lo"]), int(row["hi"])
 
+    def _candidate_rows(
+        self, q: str, tokens: list[str], book_ids: set[int] | None = None
+    ) -> list[sqlite3.Row]:
+        """取候选证据块。
+
+        优先用二元组 FTS5 索引定位候选：既避免全表扫描，又顺带取出缓存的
+        ``norm_text``（不再对每一块重算 _normalise）。
+        出现单字词时无法用二元组表达，回退全表扫描以保证召回不降级。
+        """
+        bigrams: set[str] = set()
+        if tokens and all(len(token) >= 2 for token in tokens):
+            bigrams.update(q[i:i + 2] for i in range(max(0, len(q) - 1)))
+            for token in tokens:
+                bigrams.update(token[i:i + 2] for i in range(len(token) - 1))
+        bigrams = {gram for gram in bigrams if gram.strip()}
+
+        if bigrams:
+            match = " OR ".join(f'"{gram}"' for gram in sorted(bigrams))
+            sql = (
+                "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
+                "n.norm_text AS norm_text "
+                "FROM chunks_fts_ngram n JOIN chunks c ON c.rowid = n.rowid "
+                "JOIN books b ON b.id = c.book_id WHERE n.bigrams MATCH ?"
+            )
+            params: list[Any] = [match]
+            if book_ids:
+                placeholders = ",".join("?" for _ in book_ids)
+                sql += f" AND c.book_id IN ({placeholders})"
+                params.extend(sorted(book_ids))
+            return self.cx.execute(sql, params).fetchall()
+
+        sql = (
+            "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
+            "NULL AS norm_text FROM chunks c JOIN books b ON b.id=c.book_id"
+        )
+        if book_ids:
+            placeholders = ",".join("?" for _ in book_ids)
+            return self.cx.execute(
+                f"{sql} WHERE c.book_id IN ({placeholders})", tuple(sorted(book_ids))
+            ).fetchall()
+        return self.cx.execute(sql).fetchall()
+
     def _python_search(self, query: str, limit: int, book_ids: set[int] | None = None) -> list[dict]:
         q = _normalise(query)
         # Prefer multi-character medical concepts over single Chinese
@@ -534,24 +631,16 @@ class Library:
             tokens = [_normalise(t) for t in _tokens(query) if t.strip()]
         if not q or not tokens:
             return []
-        sql = (
-            "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path "
-            "FROM chunks c JOIN books b ON b.id=c.book_id"
-        )
-        if book_ids:
-            placeholders = ",".join("?" for _ in book_ids)
-            rows = self.cx.execute(
-                f"{sql} WHERE c.book_id IN ({placeholders})", tuple(sorted(book_ids))
-            ).fetchall()
-        else:
-            rows = self.cx.execute(sql).fetchall()
+        rows = self._candidate_rows(q, tokens, book_ids)
         scored: list[tuple[float, sqlite3.Row]] = []
         # Character n-grams help recall OCR variants; concept coverage and
         # metadata boosts prevent generic words such as “位置/特点” from
         # dominating the ranking.
         qgrams = {q[i:i + 2] for i in range(max(0, len(q) - 1))} or {q}
         for row in rows:
-            text = _normalise(row["text"])
+            # norm_text 来自二元组索引的缓存；回退全表扫描时为 NULL，现场规范化
+            cached = row["norm_text"]
+            text = cached if cached is not None else _normalise(row["text"])
             section = _normalise(row["section"])
             book = _normalise(row["book"])
             grams = {text[i:i + 2] for i in range(max(0, len(text) - 1))}
