@@ -49,7 +49,7 @@ from typing import Any
 
 from .library import Library
 from .pdftext import cached_analyze, kind_label, recommendation
-from .pipeline import PACKAGE_ROOT, run_book_pipeline, venv_python
+from .pipeline import PACKAGE_ROOT, run_book_pipeline, validate_pdf, venv_python
 from .tasks import Task, TaskManager
 from .workspace import safe_dir_name, scan_books
 
@@ -641,11 +641,17 @@ class Handler(BaseHTTPRequestHandler):
                     stream.write(chunk)
                     written += len(chunk)
                     task.set_progress(written, length, f"{written / 1024 / 1024:.1f} / {length / 1024 / 1024:.1f} MB")
+            # 字节收齐后先校验，再原子落盘：无效/截断的文件不能进书库
+            validate_pdf(temp, label=f"上传的 {filename}")
             os.replace(temp, target)
         except InterruptedError:
             temp.unlink(missing_ok=True)
             task.mark_cancelled()
             return self._send_error_json(400, "上传已取消")
+        except ValueError as exc:
+            temp.unlink(missing_ok=True)
+            task.mark_error(str(exc))
+            return self._send_error_json(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             temp.unlink(missing_ok=True)
             task.mark_error(str(exc))
@@ -662,8 +668,8 @@ class Handler(BaseHTTPRequestHandler):
                 task.log("建议：直接运行「文字层解析 + 建立索引」，无需 OCR")
             else:
                 task.log("建议：使用 OCR 流水线（OCR → 版面 → 表格 → 纪错 → 结构化 → 索引）")
-        except Exception as exc:  # noqa: BLE001 - 检测失败不影响上传结果
-            task.log(f"PDF 检测失败：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 已确认是有效 PDF，检测失败不影响上传结果
+            task.log(f"警告：PDF 文字层检测失败（文件本身有效）：{exc}")
         task.mark_done(f"上传完成：{target}")
         self.app.invalidate_books()
         self._send_data({"task_id": task.id, "path": str(target), "book_dir": str(book_dir)})

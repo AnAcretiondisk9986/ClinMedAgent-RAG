@@ -226,6 +226,69 @@ class ImportPdfTests(unittest.TestCase):
         self.assertEqual(target, self.source.resolve())
         self.assertFalse((book_dir / "PDF" / "我的教材.pdf").exists())
 
+    def test_validate_pdf_accepts_real_pdf(self) -> None:
+        info = pipeline.validate_pdf(self.source)
+        self.assertEqual(info["pages"], 2)
+        self.assertGreater(info["size"], 0)
+
+    def test_validate_pdf_rejects_malformed_files(self) -> None:
+        cases = {
+            "文本伪装": b"not a pdf",
+            "空文件": b"",
+            "只有文件头": b"%PDF-1.4\n",
+        }
+        for label, payload in cases.items():
+            path = self.tmp / "src" / f"{label}.pdf"
+            path.write_bytes(payload)
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    pipeline.validate_pdf(path)
+
+    def test_validate_pdf_rejects_truncated_pdf(self) -> None:
+        data = self.source.read_bytes()
+        truncated = self.tmp / "src" / "截断.pdf"
+        truncated.write_bytes(data[: len(data) // 2])
+        with self.assertRaises(ValueError):
+            pipeline.validate_pdf(truncated)
+
+    def test_validate_pdf_enforces_page_limit(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            pipeline.validate_pdf(self.source, max_pages=1)
+        self.assertIn("上限", str(ctx.exception))
+
+    def test_import_invalid_pdf_fails_and_leaves_no_trace(self) -> None:
+        """无效 PDF：抛错、不落盘、不留 .part，且清掉刚建的空目录。"""
+        bad = self.tmp / "src" / "坏教材.pdf"
+        bad.write_text("not a pdf", encoding="utf-8")
+        task = TaskManager().create_manual("import", "导入")
+        with self.assertRaises(ValueError):
+            pipeline.import_pdf(task, self.tmp, bad, title="坏教材")
+        self.assertFalse((self.tmp / "res" / "坏教材").exists())
+        self.assertEqual(list((self.tmp / "res").rglob("*.part")), [])
+        self.assertEqual(list((self.tmp / "res").rglob("坏教材.pdf")), [])
+
+    def test_import_failure_is_reported_as_task_error(self) -> None:
+        """走 TaskManager 时，导入失败必须让任务变成 error（不是 done）。"""
+        bad = self.tmp / "src" / "坏教材.pdf"
+        bad.write_text("not a pdf", encoding="utf-8")
+        manager = TaskManager()
+        task = manager.create(
+            "import", "导入坏教材",
+            lambda current: pipeline.import_pdf(current, self.tmp, bad, title="坏教材"),
+        )
+        deadline = time.time() + 30
+        while task.status in ("pending", "running") and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(task.status, "error")
+        self.assertIn("不是 PDF", task.error)
+
+    def test_import_copy_uses_part_file_without_residue(self) -> None:
+        task = TaskManager().create_manual("import", "导入")
+        pipeline.import_pdf(task, self.tmp, self.source, title="生理学 第9版")
+        pdf_dir = self.tmp / "res" / "生理学 第9版" / "PDF"
+        self.assertEqual([p.name for p in pdf_dir.glob("*.pdf")], ["我的教材.pdf"])
+        self.assertEqual(list(pdf_dir.glob("*.part")), [])
+
 
 class PipelineEndToEndTests(unittest.TestCase):
     def test_structure_and_index_in_temp_root(self) -> None:

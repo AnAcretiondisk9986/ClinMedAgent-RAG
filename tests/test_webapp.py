@@ -263,11 +263,36 @@ class ImportTests(WebAppTestCase):
         self.assertTrue((self.tmp / "res" / "上传教材" / "PDF" / "上传教材.pdf").exists())
 
     def test_upload_rejects_conflicting_pdf(self) -> None:
+        source = self.tmp / "冲突源.pdf"
+        make_pdf(source, pages=1)
         first = self.json_data("/api/import/begin", "POST", {"filename": "a.pdf", "title": "冲突教材"})
-        self.request(first[1]["data"]["upload_url"], "PUT", raw=b"%PDF-1.4\n", headers={"Content-Type": "application/pdf"})
+        status, _, body = self.request(
+            first[1]["data"]["upload_url"],
+            "PUT",
+            raw=source.read_bytes(),
+            headers={"Content-Type": "application/pdf"},
+        )
+        self.assertEqual(status, 200, body)
         status, payload = self.json_data("/api/import/begin", "POST", {"filename": "b.pdf", "title": "冲突教材"})
         self.assertEqual(status, 400)
         self.assertIn("已存在", payload["error"])
+
+    def test_streamed_upload_rejects_invalid_pdf(self) -> None:
+        """无效 PDF 上传必须失败：不能落盘、不能留 .part、任务必须 error。"""
+        status, payload = self.json_data(
+            "/api/import/begin", "POST", {"filename": "坏的.pdf", "title": "坏教材"}
+        )
+        self.assertEqual(status, 200)
+        begin = payload["data"]
+        status, _, body = self.request(
+            begin["upload_url"], "PUT", raw=b"not a pdf", headers={"Content-Type": "application/pdf"}
+        )
+        self.assertEqual(status, 400, body)
+        task = self.wait_task(begin["task_id"])
+        self.assertEqual(task["status"], "error")
+        pdf_dir = self.tmp / "res" / "坏教材" / "PDF"
+        self.assertFalse((pdf_dir / "坏的.pdf").exists())
+        self.assertEqual(list(pdf_dir.glob("*.part")), [])
 
 
 class ProcessTests(WebAppTestCase):

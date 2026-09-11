@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import fitz
+
 from .pdftext import cached_analyze, kind_label
 from .tasks import Task, TaskCancelled
 from .workspace import safe_dir_name
@@ -472,12 +474,72 @@ def run_book_pipeline(
     return selected
 
 
+PDF_MAGIC = b"%PDF-"
+MAX_PDF_PAGES = 6000  # 单本教材页数上限，防止压缩炸弹/误传超大文件
+
+
+def validate_pdf(
+    path: Path | str,
+    label: str = "文件",
+    max_pages: int | None = MAX_PDF_PAGES,
+) -> dict[str, Any]:
+    """确认文件是可正常打开的 PDF，否则抛 ``ValueError``。
+
+    校验链：非空 → 带 ``%PDF-`` 文件头 → fitz 能打开 → 未加密 → 页数 > 0
+    → 页数不超上限 → 末页可解析（能暴露截断/损坏）。调用方拿到异常后
+    应删除临时文件并把任务标记为 error，而不是只写日志。
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"{label}不可读：{exc}") from exc
+    if size == 0:
+        raise ValueError(f"{label}是空文件（0 字节），不是有效的 PDF")
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(1024)
+    except OSError as exc:
+        raise ValueError(f"{label}不可读：{exc}") from exc
+    if PDF_MAGIC not in head:
+        raise ValueError(f"{label}不是 PDF（文件头缺少 %PDF-）")
+    try:
+        with fitz.open(path) as doc:
+            if doc.needs_pass:
+                raise ValueError(f"{label}已加密，需要密码才能打开")
+            pages = len(doc)
+            if pages <= 0:
+                raise ValueError(f"{label}没有任何页面（0 页）")
+            if max_pages is not None and pages > max_pages:
+                raise ValueError(f"{label}共 {pages} 页，超过单本上限 {max_pages} 页")
+            doc[pages - 1].get_text()  # 触发末页解析，暴露截断/损坏的 PDF
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - fitz 对损坏文件抛的异常类型不稳定
+        raise ValueError(f"{label}不是有效的 PDF，或文件已损坏（{type(exc).__name__}: {exc}）") from exc
+    return {"pages": pages, "size": size}
+
+
+def _remove_empty(paths: list[Path]) -> None:
+    """删除导入失败后残留的空目录（从内到外），已含文件的目录保留。"""
+    for path in paths:
+        try:
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            pass
+
+
 def _log_pdf_kind(task: Task, root: Path, pdf: Path) -> dict[str, Any] | None:
-    """导入完成后立刻检测文字层，把结论写进任务日志。"""
+    """导入完成后立刻检测文字层，把结论写进任务日志。
+
+    走到这里时 ``validate_pdf`` 已确认文件是有效 PDF，因此检测失败（例如缓存
+    目录不可写）只记录告警，不影响导入结果。
+    """
     try:
         info = cached_analyze(pdf, root / ".medical_rag" / "pdf_text")
-    except Exception as exc:  # noqa: BLE001 - 检测失败不应阻断导入
-        task.log(f"PDF 检测失败：{exc}")
+    except Exception as exc:  # noqa: BLE001 - 已确认是有效 PDF，检测失败不阻断导入
+        task.log(f"警告：PDF 文字层检测失败（文件本身有效）：{exc}")
         return None
     task.log(
         f"PDF 检测：{kind_label(info.get('kind'))}，"
@@ -506,16 +568,20 @@ def import_pdf(
     source = Path(source).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(f"文件不存在：{source}")
+    if source.is_dir():
+        raise ValueError(f"这是一个目录，不是 PDF 文件：{source}")
     if source.suffix.lower() != ".pdf":
         raise ValueError("目前只支持 PDF 文件")
+
+    # 先校验源文件，避免无效文件走到一半才失败、留下空的 res/<书名>/ 目录
+    source_info = validate_pdf(source, label=f"源文件 {source.name}")
 
     name = safe_dir_name(title or source.stem)
     book_dir = root / "res" / name
     pdf_dir = book_dir / "PDF"
     target = pdf_dir / source.name
-    pdf_dir.mkdir(parents=True, exist_ok=True)
 
-    existing = sorted(pdf_dir.glob("*.pdf"))
+    existing = sorted(pdf_dir.glob("*.pdf")) if pdf_dir.is_dir() else []
     others = [path for path in existing if path.name != target.name]
     if others:
         raise FileExistsError(
@@ -535,18 +601,33 @@ def import_pdf(
         task.set_progress(1, 1, "仅记录引用")
         return book_dir, source
 
-    size = source.stat().st_size
-    task.log(f"复制 PDF：{source} → {target}（{_human_size(size)}）")
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    size = source_info["size"]
+    temp = target.with_name(target.name + ".part")
+    temp.unlink(missing_ok=True)
+    task.log(f"复制 PDF：{source} → {target}（{_human_size(size)}，{source_info['pages']} 页）")
     done = 0
-    with source.open("rb") as src, target.open("wb") as dst:
-        while True:
-            task.check_cancelled()
-            chunk = src.read(1024 * 1024)
-            if not chunk:
-                break
-            dst.write(chunk)
-            done += len(chunk)
-            task.set_progress(done, size, f"{_human_size(done)} / {_human_size(size)}")
+    try:
+        with source.open("rb") as src, temp.open("wb") as dst:
+            while True:
+                task.check_cancelled()
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                done += len(chunk)
+                task.set_progress(done, size, f"{_human_size(done)} / {_human_size(size)}")
+        # 复制完成后再校验副本：磁盘写满/中途截断都会在这里被拦下
+        validate_pdf(temp, label=f"复制到 {target.name} 的文件")
+        os.replace(temp, target)
+    except BaseException as exc:
+        temp.unlink(missing_ok=True)
+        _remove_empty([pdf_dir, book_dir])
+        if isinstance(exc, TaskCancelled):
+            raise
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError(f"导入失败：{type(exc).__name__}: {exc}") from exc
     task.set_progress(1, 1, "导入完成")
     _log_pdf_kind(task, root, target)
     task.log("导入完成")
