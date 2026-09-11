@@ -73,6 +73,15 @@ def safe_file_name(name: str, fallback: str = "教材.pdf") -> str:
     return name[:120]
 
 
+def book_lock_key(directory: Path | str) -> str:
+    """教材目录的规范化锁键（Windows 下忽略大小写，路径分隔符统一）。
+
+    同一本教材的处理 / 重建索引 / 导入共用一个键，避免多个任务同时写
+    text_v3、processed_v3、SQLite 索引与缓存 PNG。
+    """
+    return os.path.normcase(str(Path(directory).resolve()))
+
+
 def interpreter_info(root: Path) -> dict[str, Any]:
     ocr = os.environ.get("MEDICAL_RAG_OCR_PYTHON") or venv_python(root, "ocr") or sys.executable
     paddle = (
@@ -204,6 +213,20 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error_json(self, status: int, message: str) -> None:
         body = json.dumps({"ok": False, "error": message}, ensure_ascii=False).encode("utf-8")
         self._send(status, body, "application/json; charset=utf-8")
+
+    def _send_conflict(self, task: Task, message: str) -> None:
+        """409：这本教材已有任务在运行，同时把已有 task_id 返回给调用方。"""
+        body = json.dumps(
+            {
+                "ok": False,
+                "error": message,
+                "data": {"task_id": task.id, "label": task.label, "status": task.status},
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        # 请求体可能还没读（超大上传），关闭连接避免 HTTP/1.1 流水线错位
+        self.close_connection = True
+        self._send(409, body, "application/json; charset=utf-8")
 
     def _send_file(self, path: Path, content_type: str, cache: str) -> None:
         try:
@@ -438,12 +461,16 @@ class Handler(BaseHTTPRequestHandler):
         from .pipeline import import_pdf  # 延迟导入，避免循环引用
 
         app = self.app
-        task = app.tasks.create(
+        book_name = title or resolved.stem
+        task, created = app.tasks.create_unique(
             "import",
-            f"导入《{title or resolved.stem}》",
+            f"导入《{book_name}》",
             lambda current: import_pdf(current, app.root, resolved, title=title),
             meta={"kind": "path", "path": str(resolved)},
+            lock_key=book_lock_key(app.root / "res" / safe_dir_name(book_name)),
         )
+        if not created:
+            return self._send_conflict(task, f"《{book_name}》已有任务在运行，请等它结束")
         self._send_data({"task_id": task.id})
 
     def _pdf_conflict(self, title: str, filename: str) -> bool:
@@ -460,12 +487,17 @@ class Handler(BaseHTTPRequestHandler):
         title = str(body.get("title") or "").strip() or Path(filename).stem
         if not filename:
             return self._send_error_json(400, "缺少文件名")
+        # 先判运行中的任务：这是比“目录已有其它 PDF”更根本的拒绝理由
+        lock_key = book_lock_key(self.app.root / "res" / safe_dir_name(title))
+        running = self.app.tasks.active_for(lock_key)
+        if running is not None:
+            return self._send_conflict(running, f"《{title}》已有任务在运行，请等它结束")
         if self._pdf_conflict(title, filename):
             return self._send_error_json(400, "同名目录已存在其他 PDF，请换一个书名")
         task = self.app.tasks.create_manual(
             "import",
             f"导入《{title}》",
-            meta={"kind": "upload", "filename": filename, "title": title},
+            meta={"kind": "upload", "filename": filename, "title": title, "lock_key": lock_key},
         )
         self._send_data(
             {
@@ -519,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
 
         app = self.app
         stages_label = "自动" if stages == "auto" or stages is None else "/".join(stages)
-        task = app.tasks.create(
+        task, created = app.tasks.create_unique(
             "process",
             f"处理《{book['title']}》（{stages_label}）",
             lambda current: run_book_pipeline(
@@ -527,7 +559,10 @@ class Handler(BaseHTTPRequestHandler):
                 dpi=dpi, device=device, reset_ocr=reset_ocr, db=app.db,
             ),
             meta={"book_id": book_id, "kind": "process", "stages": stages},
+            lock_key=book_lock_key(book["dir"]),
         )
+        if not created:
+            return self._send_conflict(task, f"《{book['title']}》已有任务在运行，请等它结束")
         self._send_data({"task_id": task.id})
 
     def _post_reindex(self) -> None:
@@ -539,12 +574,15 @@ class Handler(BaseHTTPRequestHandler):
         if not book["status"]["structure"]["complete"]:
             return self._send_error_json(400, "还没有结构化结果（processed_v3/structured），请先处理教材")
         app = self.app
-        task = app.tasks.create(
+        task, created = app.tasks.create_unique(
             "index",
             f"重建索引《{book['title']}》",
             lambda current: run_book_pipeline(current, app.root, book, stages=["index"], db=app.db),
             meta={"book_id": book_id, "kind": "reindex"},
+            lock_key=book_lock_key(book["dir"]),
         )
+        if not created:
+            return self._send_conflict(task, f"《{book['title']}》已有任务在运行，请等它结束")
         self._send_data({"task_id": task.id})
 
     def _post_search(self) -> None:
@@ -609,6 +647,13 @@ class Handler(BaseHTTPRequestHandler):
         if task.status != "pending":
             self._drain_body()
             return self._send_error_json(409, "该上传任务已经开始或结束")
+        # 真正开始写书库前才占锁，避免放弃上传后残留 pending 任务永久阻塞这本教材
+        lock_key = str(task.meta.get("lock_key") or "")
+        if not self.app.tasks.acquire_lock(task, lock_key):
+            return self._send_conflict(
+                self.app.tasks.active_for(lock_key) or task,
+                "这本教材已有任务在运行，请等它结束",
+            )
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return self._send_error_json(411, "缺少 Content-Length 或文件为空")

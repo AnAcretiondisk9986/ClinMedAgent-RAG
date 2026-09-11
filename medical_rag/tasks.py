@@ -280,18 +280,32 @@ class TaskManager:
         runner: Callable[[Task], None],
         meta: dict[str, Any] | None = None,
     ) -> Task:
+        task, _ = self.create_unique(kind, label, runner, meta=meta)
+        return task
+
+    def create_unique(
+        self,
+        kind: str,
+        label: str,
+        runner: Callable[[Task], None],
+        meta: dict[str, Any] | None = None,
+        lock_key: str = "",
+    ) -> tuple[Task, bool]:
+        """原子地创建任务。``lock_key`` 上已有运行中任务时返回 ``(已有任务, False)``。
+
+        检查和登记在同一把锁内完成，因此两个并发 HTTP 请求不可能同时拿到同一本
+        教材的写入权（参见 WebApp 的每本教材互斥）。
+        """
         task = Task(kind, label, meta)
         task._runner = runner
         with self._lock:
-            self._tasks[task.id] = task
-            while len(self._tasks) > self._max_tasks:
-                oldest_id, oldest = next(iter(self._tasks.items()))
-                if oldest.status in ("running", "pending"):
-                    break
-                self._tasks.pop(oldest_id)
+            existing = self._active_locked(lock_key)
+            if existing is not None:
+                return existing, False
+            self._claim_locked(task, lock_key)
         thread = threading.Thread(target=self._run, args=(task,), name=f"task-{task.id}", daemon=True)
         thread.start()
-        return task
+        return task, True
 
     def create_manual(
         self,
@@ -300,15 +314,66 @@ class TaskManager:
         meta: dict[str, Any] | None = None,
     ) -> Task:
         """注册一个由调用方自己驱动的任务（如 HTTP 流式上传）。"""
+        task, _ = self.create_manual_unique(kind, label, meta=meta)
+        return task
+
+    def create_manual_unique(
+        self,
+        kind: str,
+        label: str,
+        meta: dict[str, Any] | None = None,
+        lock_key: str = "",
+    ) -> tuple[Task, bool]:
+        """手动任务的 create_unique；默认不占锁。
+
+        上传任务不在创建时占锁，而是等 ``_put_upload`` 真正开始写入时再调
+        :meth:`acquire_lock`——否则用户放弃上传后残留的 pending 任务会永久阻塞
+        这本教材。
+        """
         task = Task(kind, label, meta)
         with self._lock:
-            self._tasks[task.id] = task
-            while len(self._tasks) > self._max_tasks:
-                oldest_id, oldest = next(iter(self._tasks.items()))
-                if oldest.status in ("running", "pending"):
-                    break
-                self._tasks.pop(oldest_id)
-        return task
+            existing = self._active_locked(lock_key)
+            if existing is not None:
+                return existing, False
+            self._claim_locked(task, lock_key)
+        return task, True
+
+    def acquire_lock(self, task: Task, lock_key: str) -> bool:
+        """给已存在的任务登记独占锁键；被其他运行中任务占用时返回 False。"""
+        if not lock_key:
+            return True
+        with self._lock:
+            if self._tasks.get(task.id) is not task:
+                return False
+            if self._active_locked(lock_key, exclude=task) is not None:
+                return False
+            task.meta["lock_key"] = lock_key
+            return True
+
+    def active_for(self, lock_key: str) -> Task | None:
+        """返回指定锁键上仍在运行（或等待运行）的任务。"""
+        with self._lock:
+            return self._active_locked(lock_key)
+
+    def _active_locked(self, lock_key: str, exclude: Task | None = None) -> Task | None:
+        if not lock_key:
+            return None
+        for task in reversed(list(self._tasks.values())):
+            if task is exclude or task.status not in ("pending", "running"):
+                continue
+            if task.meta.get("lock_key") == lock_key:
+                return task
+        return None
+
+    def _claim_locked(self, task: Task, lock_key: str) -> None:
+        if lock_key:
+            task.meta["lock_key"] = lock_key
+        self._tasks[task.id] = task
+        while len(self._tasks) > self._max_tasks:
+            oldest_id, oldest = next(iter(self._tasks.items()))
+            if oldest.status in ("running", "pending"):
+                break
+            self._tasks.pop(oldest_id)
 
     @staticmethod
     def _run(task: Task) -> None:

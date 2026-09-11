@@ -106,5 +106,88 @@ class LibraryIngestTests(unittest.TestCase):
                 lib.close()
 
 
+class FtsIndexConsistencyTests(unittest.TestCase):
+    """chunks_fts 是 external-content FTS5 表，重建后旧词条必须消失。"""
+
+    @staticmethod
+    def _hits(lib: Library, term: str) -> int:
+        return int(
+            lib.cx.execute(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?", (term,)
+            ).fetchone()[0]
+        )
+
+    def _make_book(self, root: Path, text: str) -> Path:
+        structured = root / "structured"
+        structured.mkdir(parents=True, exist_ok=True)
+        chapter = structured / "01-ch.md"
+        chapter.write_text(f"# Ch1\n\n## 原书第 10 页\n\n{text}\n", encoding="utf-8")
+        return chapter
+
+    def test_reingest_removes_stale_fts_terms(self) -> None:
+        """重建索引后，只存在于旧版本的词不能再被 FTS 命中（防幽灵结果）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chapter = self._make_book(root, "periosteum contains vessels zzzold")
+            lib = Library(root / "library.sqlite3")
+            try:
+                lib.ingest_markdown_tree(root, "测试教材")
+                self.assertEqual(self._hits(lib, "zzzold"), 1)
+
+                chapter.write_text(
+                    "# Ch1\n\n## 原书第 10 页\n\nbone substance is dense zzznew\n",
+                    encoding="utf-8",
+                )
+                lib.ingest_markdown_tree(root, "测试教材")
+
+                self.assertEqual(self._hits(lib, "zzzold"), 0)
+                self.assertEqual(self._hits(lib, "periosteum"), 0)
+                self.assertEqual(self._hits(lib, "vessels"), 0)
+                self.assertEqual(self._hits(lib, "zzznew"), 1)
+                self.assertTrue(lib.fts_integrity_ok())
+            finally:
+                lib.close()
+
+    def test_rebuild_fts_index_repairs_drift(self) -> None:
+        """模拟历史版本留下的一致性损坏，rebuild 应能修复。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_book(root, "periosteum vessels zzzold")
+            lib = Library(root / "library.sqlite3")
+            try:
+                lib.ingest_markdown_tree(root, "测试教材")
+                # 绕过 FTS 维护直接改 chunks，制造漂移
+                lib.cx.execute("UPDATE chunks SET text = 'bone substance dense zzzedited'")
+                lib.cx.commit()
+                self.assertFalse(lib.fts_integrity_ok())
+
+                lib.rebuild_fts_index()
+
+                self.assertTrue(lib.fts_integrity_ok())
+                self.assertEqual(self._hits(lib, "zzzedited"), 1)
+                self.assertEqual(self._hits(lib, "zzzold"), 0)
+            finally:
+                lib.close()
+
+    def test_two_connections_rebuild_same_book(self) -> None:
+        """两个连接（模拟两个进程）先后重建同一本书：不重复建书、索引保持一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_book(root, "alpha beta gamma")
+            db = root / "library.sqlite3"
+            first, second = Library(db), Library(db)
+            try:
+                first.ingest_markdown_tree(root, "测试教材")
+                second.ingest_markdown_tree(root, "测试教材")
+                self.assertEqual(len(first.list_books()), 1)
+                self.assertEqual(
+                    first.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 1
+                )
+                self.assertTrue(first.fts_integrity_ok())
+            finally:
+                first.close()
+                second.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -64,12 +64,22 @@ class Library:
     def __init__(self, db: Path | str | None = None):
         self.db = Path(db or os.environ.get("MEDICAL_RAG_DB") or DEFAULT_DB).expanduser().resolve()
         self.db.parent.mkdir(parents=True, exist_ok=True)
-        self.cx = sqlite3.connect(self.db)
+        self.cx = sqlite3.connect(self.db, timeout=30.0)
         self.cx.row_factory = sqlite3.Row
+        # WAL：重建索引的大写事务进行期间读者不被阻塞；busy_timeout：并发写自动串行化
+        self.cx.execute("PRAGMA busy_timeout = 30000")
+        self.cx.execute("PRAGMA journal_mode = WAL")
+        self.cx.execute("PRAGMA synchronous = NORMAL")
         self._init_schema()
 
     def close(self) -> None:
-        self.cx.close()
+        try:
+            if self.cx.in_transaction:  # 未提交的写事务回滚，避免留下半套索引
+                self.cx.rollback()
+        except sqlite3.Error:
+            pass
+        finally:
+            self.cx.close()
 
     def _init_schema(self) -> None:
         self.cx.executescript(
@@ -101,10 +111,33 @@ class Library:
         self.cx.commit()
 
     def _delete_book_chunks(self, book_id: int) -> None:
-        rows = self.cx.execute("SELECT rowid FROM chunks WHERE book_id = ?", (book_id,)).fetchall()
-        for row in rows:
-            self.cx.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text, section) VALUES('delete', ?, '', '')", (row[0],))
+        """删除某本书的全部块，并同步维护 FTS 索引。
+
+        ``chunks_fts`` 是 external-content FTS5 表：``'delete'`` 命令必须带上
+        原始列值（text/section），否则旧词条不会被移除。``chunks.rowid`` 会被
+        复用，残留词条会让检索命中已经不存在的内容（幽灵结果），同时
+        ``integrity-check`` 会报 ``database disk image is malformed``。
+        """
+        self.cx.execute(
+            "INSERT INTO chunks_fts(chunks_fts, rowid, text, section) "
+            "SELECT 'delete', rowid, text, section FROM chunks WHERE book_id = ?",
+            (book_id,),
+        )
         self.cx.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
+
+    def fts_integrity_ok(self) -> bool:
+        """检查 chunks_fts 与 chunks 是否一致（rank=1 会逐行与 content 表核对）。"""
+        try:
+            self.cx.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)")
+        except sqlite3.DatabaseError:
+            return False
+        return True
+
+    def rebuild_fts_index(self) -> int:
+        """重建 FTS 索引，修复历史遗留的 chunks / chunks_fts 不一致。"""
+        self.cx.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        self.cx.commit()
+        return int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
 
     @staticmethod
     def _chunk_page(text: str, max_chars: int = 1200) -> Iterable[str]:
@@ -185,6 +218,8 @@ class Library:
         if not files:
             raise FileNotFoundError(f"未找到可索引 Markdown：{root}")
         title = title or root.parent.name
+        # 整本重建在一个写事务里完成：中途失败不会留下半套索引，并发重建在此串行化
+        self.cx.execute("BEGIN IMMEDIATE")
         existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(root),)).fetchone()
         if existing:
             book_id = existing[0]

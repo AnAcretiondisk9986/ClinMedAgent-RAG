@@ -8,9 +8,11 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import fitz
 
+from medical_rag import webapp as webapp_module
 from medical_rag.library import Library
 from medical_rag.webapp import create_server
 
@@ -320,6 +322,94 @@ class ImportTests(WebAppTestCase):
         pdf_dir = self.tmp / "res" / "坏教材" / "PDF"
         self.assertFalse((pdf_dir / "坏的.pdf").exists())
         self.assertEqual(list(pdf_dir.glob("*.part")), [])
+
+
+class BookConcurrencyTests(WebAppTestCase):
+    """同一本教材的所有写操作（处理/重建索引/导入）必须互斥。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+        def slow_pipeline(current, *args, **kwargs):
+            self.started.set()
+            self.release.wait(timeout=30)
+
+        patcher = mock.patch.object(webapp_module, "run_book_pipeline", slow_pipeline)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.release.set)
+
+    def _start_process(self, book_id: str) -> str:
+        status, payload = self.json_data(
+            "/api/process", "POST", {"book_id": book_id, "stages": ["index"]}
+        )
+        self.assertEqual(status, 200, payload)
+        task_id = payload["data"]["task_id"]
+        self.assertTrue(self.started.wait(timeout=10), "任务未开始")
+        return task_id
+
+    def test_second_process_on_same_book_is_rejected(self) -> None:
+        book_id = self.book_id()
+        first_id = self._start_process(book_id)
+
+        status, payload = self.json_data(
+            "/api/process", "POST", {"book_id": book_id, "stages": ["index"]}
+        )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["data"]["task_id"], first_id)
+        self.assertIn("已有任务在运行", payload["error"])
+
+        self.release.set()
+        self.assertEqual(self.wait_task(first_id)["status"], "done")
+
+    def test_reindex_is_rejected_while_process_runs(self) -> None:
+        processed = self.book_dir / "processed_v3"
+        structured = processed / "structured"
+        structured.mkdir(parents=True, exist_ok=True)
+        (structured / "01-肌学.md").write_text(
+            "# 第一章 肌学\n\n## 原书第 1 页\n\n骨骼肌由肌腹和肌腱构成。\n", encoding="utf-8"
+        )
+        # _post_reindex 要求 structure.complete，而它需要 quality.json 存在
+        (processed / "quality.json").write_text(
+            json.dumps({"pages": 3, "page_offset": 0, "chapters": []}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.server.app.invalidate_books()
+        book_id = self.book_id()
+        first_id = self._start_process(book_id)
+
+        status, payload = self.json_data("/api/reindex", "POST", {"book_id": book_id})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["data"]["task_id"], first_id)
+
+        self.release.set()
+        self.wait_task(first_id)
+
+    def test_different_books_are_not_blocked(self) -> None:
+        other = self.tmp / "res" / "另一本教材" / "PDF"
+        make_pdf(other / "另一本教材.pdf", pages=1)
+        self.server.app.invalidate_books()
+        _, payload = self.json_data("/api/books")
+        ids = [book["id"] for book in payload["data"]]
+        self.assertGreaterEqual(len(ids), 2)
+
+        first_id = self._start_process(ids[0])
+        second_id = self._start_process(ids[1])
+        self.assertNotEqual(first_id, second_id)
+        self.release.set()
+
+    def test_upload_is_rejected_while_process_runs(self) -> None:
+        book_id = self.book_id()
+        self._start_process(book_id)
+        # 上传登记：目标目录与正在处理的教材目录相同
+        status, payload = self.json_data(
+            "/api/import/begin", "POST", {"filename": "新.pdf", "title": "测试教材"}
+        )
+        self.assertEqual(status, 409, payload)
+        self.assertIn("已有任务在运行", payload["error"])
+        self.release.set()
 
 
 class ProcessTests(WebAppTestCase):
