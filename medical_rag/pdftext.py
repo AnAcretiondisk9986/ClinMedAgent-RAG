@@ -33,6 +33,8 @@ from typing import Any
 
 import fitz
 
+from .outputs import chapter_file_name, staged_output_dir
+
 MIN_PAGE_CHARS = 30  # 单页至少这么多非空白字符才算“有文字”
 # 判定规则：以文字层覆盖率为主，平均字数只用来兜底“每页只有水印/页码”的情况
 RATIO_TEXT = 0.5    # 至少一半页面有文字
@@ -356,63 +358,70 @@ def build_structured(
         chapters = [{"num": 1, "pdf_start": 1, "title": "正文"}]
 
     out = book_dir / "processed_v3"
-    cleaned_dir = out / "cleaned"
-    structured_dir = out / "structured"
-    cleaned_dir.mkdir(parents=True, exist_ok=True)
-    structured_dir.mkdir(parents=True, exist_ok=True)
-
-    for number, lines in enumerate(page_lines, start=1):
-        header = f"# PDF第 {number} 页（原书第 {number - offset} 页）"
-        (cleaned_dir / f"page-{number:04d}.md").write_text(
-            header + "\n\n" + "\n\n".join(lines) + "\n", encoding="utf-8"
-        )
-
     quality_chapters: list[dict] = []
-    for index, chapter in enumerate(chapters):
-        num, start, title = chapter["num"], max(1, chapter["pdf_start"]), chapter["title"]
-        end = chapters[index + 1]["pdf_start"] - 1 if index + 1 < len(chapters) else total
-        end = min(total, end)
-        body = [
-            f"# 第{num}章 {title}",
-            "",
-            f"> 来源范围：原书第 {start - offset}-{end - offset} 页（PDF 第 {start}-{end} 页）。",
-            "> 来源：PDF 文字层直接解析（未使用 OCR）。",
-            f"> 页码为页脚校准后的原书页码（原书页 = PDF 页 − {offset}）。",
-            "",
-        ]
-        for number in range(start, end + 1):
-            lines = page_lines[number - 1]
-            if not lines:
-                continue
-            body.append(f"## 原书第 {number - offset} 页")
-            body.append("")
-            body.extend(lines)
-            body.append("")
-        (structured_dir / f"{num:02d}-{title}.md").write_text("\n".join(body), encoding="utf-8")
-        print(f"第{num}章 {title}: PDF {start}-{end} → 原书 {start - offset}-{end - offset}", flush=True)
-        quality_chapters.append(
-            {
-                "num": num,
-                "title": title,
-                "pdf_start": start,
-                "pdf_end": end,
-                "printed_start": start - offset,
-                "printed_end": end - offset,
-            }
-        )
+    # 写进暂存目录，全部成功后再整体替换：旧章节文件不会残留，重建失败也不会
+    # 留下半套结果（见 medical_rag/outputs.py）。
+    with staged_output_dir(out) as staging:
+        cleaned_dir = staging / "cleaned"
+        structured_dir = staging / "structured"
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+        structured_dir.mkdir(parents=True, exist_ok=True)
 
-    quality = {
-        "pages": total,
-        "page_offset": offset,
-        "page_offset_samples": offset_samples,
-        "page_offset_support": offset_support,
-        "auto_chapters": not _load_chapters(Path(chapters_path) if chapters_path else None),
-        "running_headers": sorted(headers),
-        "pipeline": "text-layer（PyMuPDF 直接解析，未使用 OCR）",
-        "table_pages": [],
-        "chapters": quality_chapters,
-    }
-    (out / "quality.json").write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8")
+        for number, lines in enumerate(page_lines, start=1):
+            header = f"# PDF第 {number} 页（原书第 {number - offset} 页）"
+            (cleaned_dir / f"page-{number:04d}.md").write_text(
+                header + "\n\n" + "\n\n".join(lines) + "\n", encoding="utf-8"
+            )
+
+        for index, chapter in enumerate(chapters):
+            num, start, title = chapter["num"], max(1, chapter["pdf_start"]), chapter["title"]
+            end = chapters[index + 1]["pdf_start"] - 1 if index + 1 < len(chapters) else total
+            end = min(total, end)
+            body = [
+                f"# 第{num}章 {title}",
+                "",
+                f"> 来源范围：原书第 {start - offset}-{end - offset} 页（PDF 第 {start}-{end} 页）。",
+                "> 来源：PDF 文字层直接解析（未使用 OCR）。",
+                f"> 页码为页脚校准后的原书页码（原书页 = PDF 页 − {offset}）。",
+                "",
+            ]
+            for number in range(start, end + 1):
+                lines = page_lines[number - 1]
+                if not lines:
+                    continue
+                body.append(f"## 原书第 {number - offset} 页")
+                body.append("")
+                body.extend(lines)
+                body.append("")
+            (structured_dir / chapter_file_name(num, title)).write_text(
+                "\n".join(body), encoding="utf-8"
+            )
+            print(f"第{num}章 {title}: PDF {start}-{end} → 原书 {start - offset}-{end - offset}", flush=True)
+            quality_chapters.append(
+                {
+                    "num": num,
+                    "title": title,
+                    "pdf_start": start,
+                    "pdf_end": end,
+                    "printed_start": start - offset,
+                    "printed_end": end - offset,
+                }
+            )
+
+        quality = {
+            "pages": total,
+            "page_offset": offset,
+            "page_offset_samples": offset_samples,
+            "page_offset_support": offset_support,
+            "auto_chapters": not _load_chapters(Path(chapters_path) if chapters_path else None),
+            "running_headers": sorted(headers),
+            "pipeline": "text-layer（PyMuPDF 直接解析，未使用 OCR）",
+            "table_pages": [],
+            "chapters": quality_chapters,
+        }
+        (staging / "quality.json").write_text(
+            json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     print(f"完成：{out}  共 {len(chapters)} 章，页码偏移 {offset}", flush=True)
     return quality
 

@@ -50,6 +50,37 @@ class LibraryAnswerTests(unittest.TestCase):
 
 
 class LibraryIngestTests(unittest.TestCase):
+    def test_staging_dirs_are_not_indexed(self) -> None:
+        """structured/ 缺失时的 rglob 兜底必须跳过 .staging-/.backup- 目录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stale = root / ".staging-abc" / "structured"
+            stale.mkdir(parents=True)
+            (stale / "01-陈旧.md").write_text(
+                "# 第一章 陈旧\n\n## 原书第 1 页\n\n这是上一轮生成残留的过期内容。\n",
+                encoding="utf-8",
+            )
+            backup = root / ".backup-xyz"
+            backup.mkdir()
+            (backup / "01-旧.md").write_text(
+                "# 第一章 旧\n\n## 原书第 1 页\n\n备份目录里的内容。\n", encoding="utf-8"
+            )
+            # 正式 structured/ 不存在 → 触发 rglob 兜底分支
+            cleaned = root / "cleaned"
+            cleaned.mkdir()
+            (cleaned / "page-0001.md").write_text(
+                "# PDF第 1 页\n\n骨骼肌由肌腹和肌腱构成。\n", encoding="utf-8"
+            )
+            lib = Library(root / "library.sqlite3")
+            try:
+                lib.ingest_markdown_tree(root, "测试教材")
+                texts = [row[0] for row in lib.cx.execute("SELECT text FROM chunks").fetchall()]
+            finally:
+                lib.close()
+            self.assertTrue(any("骨骼肌" in text for text in texts))
+            self.assertFalse(any("过期内容" in text for text in texts))
+            self.assertFalse(any("备份目录" in text for text in texts))
+
     def test_inner_headings_become_sections_and_chunk_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

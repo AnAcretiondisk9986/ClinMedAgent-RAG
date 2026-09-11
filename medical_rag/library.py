@@ -11,6 +11,7 @@ from typing import Iterable
 
 import fitz
 
+from .outputs import is_internal_output
 from .qa import match_book, plan_question, strip_book_mention
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -180,7 +181,7 @@ class Library:
         """Index processed Markdown while preserving chapter/page citations."""
         root = Path(text_dir).expanduser().resolve()
         files = sorted((root / "structured").glob("*.md")) if (root / "structured").exists() else sorted(root.rglob("*.md"))
-        files = [f for f in files if f.name not in {"README.md", "book.md"}]
+        files = [f for f in files if f.name not in {"README.md", "book.md"} and not is_internal_output(f)]
         if not files:
             raise FileNotFoundError(f"未找到可索引 Markdown：{root}")
         title = title or root.parent.name

@@ -25,6 +25,8 @@ from pathlib import Path
 
 import tools_structure_v2 as v2
 
+from medical_rag.outputs import chapter_file_name, staged_output_dir
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_BOOK_DIR = ROOT / "res" / "系统解剖学"
 
@@ -248,66 +250,74 @@ def main() -> None:
 
     cleaned_dir = out_dir / "cleaned"
     structured_dir = out_dir / "structured"
-    cleaned_dir.mkdir(parents=True, exist_ok=True)
-    structured_dir.mkdir(parents=True, exist_ok=True)
 
     page_content: dict[int, list[str]] = {}
     table_pages: list[int] = []
-    for n in range(1, total_pages + 1):
-        if not (boxes_dir / f"page-{n:04d}.json").exists():
-            continue
-        blocks, info = rebuild_page(n, headers)
-        if info.get("table_page"):
-            table_pages.append(n)
-        page_content[n] = blocks
-        header = f"# PDF第 {n} 页（原书第 {n - offset} 页）"
-        (cleaned_dir / f"page-{n:04d}.md").write_text(
-            header + "\n\n" + "\n\n".join(blocks) + "\n", encoding="utf-8"
-        )
+    # 写进暂存目录，全部成功后再整体替换：章节变少时旧 Markdown 不会残留
+    # 而继续被索引（见 medical_rag/outputs.py）。
+    with staged_output_dir(out_dir) as staging:
+        cleaned_dir = staging / "cleaned"
+        structured_dir = staging / "structured"
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+        structured_dir.mkdir(parents=True, exist_ok=True)
 
-    quality_chapters = []
-    for idx, chapter in enumerate(chapters):
-        num, start, title = chapter["num"], chapter["pdf_start"], chapter["title"]
-        end = chapters[idx + 1]["pdf_start"] - 1 if idx + 1 < len(chapters) else total_pages
-        body: list[str] = [
-            f"# 第{num}章 {title}",
-            "",
-            f"> 来源范围：原书第 {start - offset}-{end - offset} 页（PDF 第 {start}-{end} 页）。",
-            "> 识别：rapidocr 3.9.2 + PP-OCRv6（GPU）；表格页：PP-StructureV3（HTML 表格）。",
-            "> 页码为页脚校准后的原书页码（原书页 = PDF 页 − %d）。" % offset,
-            "",
-        ]
-        for n in range(start, end + 1):
-            if n not in page_content:
+        for n in range(1, total_pages + 1):
+            if not (boxes_dir / f"page-{n:04d}.json").exists():
                 continue
-            body.append(f"## 原书第 {n - offset} 页")
-            body.append("")
-            body.extend(page_content[n])
-            body.append("")
-        (structured_dir / f"{num:02d}-{title}.md").write_text("\n".join(body), encoding="utf-8")
-        quality_chapters.append(
-            {"num": num, "title": title, "pdf_start": start, "pdf_end": end,
-             "printed_start": start - offset, "printed_end": end - offset}
-        )
-        print(f"第{num}章 {title}: PDF {start}-{end} → 原书 {start - offset}-{end - offset}")
+            blocks, info = rebuild_page(n, headers)
+            if info.get("table_page"):
+                table_pages.append(n)
+            page_content[n] = blocks
+            header = f"# PDF第 {n} 页（原书第 {n - offset} 页）"
+            (cleaned_dir / f"page-{n:04d}.md").write_text(
+                header + "\n\n" + "\n\n".join(blocks) + "\n", encoding="utf-8"
+            )
 
-    (out_dir / "quality.json").write_text(
-        json.dumps(
-            {
-                "pages": total_pages,
-                "page_offset": offset,
-                "page_offset_samples": samples,
-                "auto_chapters": not chapters_path.exists(),
-                "running_headers": sorted(headers),
-                "pipeline": "text_v3 boxes(PP-OCRv6) -> xy-cut 重建；表格页用 PP-StructureV3 markdown",
-                "table_pages": sorted(table_pages),
-                "chapters": quality_chapters,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+        quality_chapters = []
+        for idx, chapter in enumerate(chapters):
+            num, start, title = chapter["num"], chapter["pdf_start"], chapter["title"]
+            end = chapters[idx + 1]["pdf_start"] - 1 if idx + 1 < len(chapters) else total_pages
+            body: list[str] = [
+                f"# 第{num}章 {title}",
+                "",
+                f"> 来源范围：原书第 {start - offset}-{end - offset} 页（PDF 第 {start}-{end} 页）。",
+                "> 识别：rapidocr 3.9.2 + PP-OCRv6（GPU）；表格页：PP-StructureV3（HTML 表格）。",
+                "> 页码为页脚校准后的原书页码（原书页 = PDF 页 − %d）。" % offset,
+                "",
+            ]
+            for n in range(start, end + 1):
+                if n not in page_content:
+                    continue
+                body.append(f"## 原书第 {n - offset} 页")
+                body.append("")
+                body.extend(page_content[n])
+                body.append("")
+            (structured_dir / chapter_file_name(num, title)).write_text(
+                "\n".join(body), encoding="utf-8"
+            )
+            quality_chapters.append(
+                {"num": num, "title": title, "pdf_start": start, "pdf_end": end,
+                 "printed_start": start - offset, "printed_end": end - offset}
+            )
+            print(f"第{num}章 {title}: PDF {start}-{end} → 原书 {start - offset}-{end - offset}")
+
+        (staging / "quality.json").write_text(
+            json.dumps(
+                {
+                    "pages": total_pages,
+                    "page_offset": offset,
+                    "page_offset_samples": samples,
+                    "auto_chapters": not chapters_path.exists(),
+                    "running_headers": sorted(headers),
+                    "pipeline": "text_v3 boxes(PP-OCRv6) -> xy-cut 重建；表格页用 PP-StructureV3 markdown",
+                    "table_pages": sorted(table_pages),
+                    "chapters": quality_chapters,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     print(f"完成：{out_dir}  共 {len(chapters)} 章，表格页 {len(table_pages)} 页")
 
 

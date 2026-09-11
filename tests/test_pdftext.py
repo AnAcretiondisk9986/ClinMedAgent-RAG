@@ -124,6 +124,31 @@ class BuildStructuredTests(unittest.TestCase):
         self.assertEqual(len(quality_json["chapters"]), 2)
         self.assertIn("10/10", output.getvalue())
 
+    def test_rebuild_removes_obsolete_chapters(self) -> None:
+        """第二次只产出一章时，旧的 02-*.md 必须被删除（不能被重新索引）。"""
+        pdf = self.tmp / "book.pdf"
+        make_text_pdf(pdf, pages=10)
+        book_dir = self.tmp / "res" / "测试教材"
+        with contextlib.redirect_stdout(io.StringIO()):
+            pdftext.build_structured(pdf, book_dir)
+        structured = book_dir / "processed_v3" / "structured"
+        self.assertEqual(
+            sorted(path.name for path in structured.glob("*.md")),
+            ["01-骨骼肌.md", "02-关节学.md"],
+        )
+
+        merged = book_dir / "chapters.json"
+        merged.write_text(json.dumps([[1, 3, "骨骼肌与关节学"]], ensure_ascii=False), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            quality = pdftext.build_structured(pdf, book_dir, chapters_path=merged)
+        self.assertEqual(len(quality["chapters"]), 1)
+        self.assertEqual(
+            sorted(path.name for path in structured.glob("*.md")),
+            ["01-骨骼肌与关节学.md"],
+        )
+        self.assertEqual(list((book_dir / "processed_v3").glob(".staging-*")), [])
+        self.assertEqual(list((book_dir / "processed_v3").glob(".backup-*")), [])
+
     def test_cli_rejects_scan_pdf(self) -> None:
         pdf = self.tmp / "scan.pdf"
         make_scan_pdf(pdf)

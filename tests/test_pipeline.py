@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -324,6 +327,44 @@ class PipelineEndToEndTests(unittest.TestCase):
             connection.close()
         self.assertEqual([row[0] for row in chunks], [1, 2])
         self.assertTrue(all("骨骼肌" in row[1] for row in chunks))
+
+
+class StructureStaleCleanupTests(unittest.TestCase):
+    """OCR 路径（tools_structure_v3）重建时，旧章节文件必须被删除。"""
+
+    def _run(self, book_dir: Path, total_pages: int) -> None:
+        import tools_structure_v3
+
+        argv = ["tools_structure_v3.py", "--book-dir", str(book_dir), "--total-pages", str(total_pages)]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+            tools_structure_v3.main()
+
+    def test_rerun_removes_obsolete_chapter_files(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_struct_"))
+        book_dir = tmp / "res" / "测试教材"
+        write_boxes(book_dir, pages=4)
+        chapters = book_dir / "chapters.json"
+        chapters.write_text(
+            json.dumps([[1, 1, "肌学"], [2, 3, "关节学"]], ensure_ascii=False), encoding="utf-8"
+        )
+        out = book_dir / "processed_v3"
+
+        self._run(book_dir, 4)
+        self.assertEqual(
+            sorted(path.name for path in (out / "structured").glob("*.md")),
+            ["01-肌学.md", "02-关节学.md"],
+        )
+
+        # 第二次合并为一章：02-关节学.md 不能残留
+        chapters.write_text(json.dumps([[1, 1, "运动系统"]], ensure_ascii=False), encoding="utf-8")
+        self._run(book_dir, 4)
+        self.assertEqual(
+            sorted(path.name for path in (out / "structured").glob("*.md")),
+            ["01-运动系统.md"],
+        )
+        self.assertEqual(list(out.glob(".staging-*")), [])
+        self.assertEqual(list(out.glob(".backup-*")), [])
+        self.assertTrue((out / "quality.json").exists())
 
 
 if __name__ == "__main__":
