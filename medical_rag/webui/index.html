@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>医学教材工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand" id="brand-home" title="返回书库概览">
+    <span class="logo">医</span>
+    <div class="brand-text">
+      <h1>医学教材工作台</h1>
+      <div class="sub" id="root-path">正在连接…</div>
+    </div>
+  </div>
+  <div class="top-actions">
+    <div class="search-box">
+      <select id="search-scope" class="search-scope" title="检索范围">
+        <option value="all">全部教材</option>
+      </select>
+      <input id="global-search-input" placeholder="检索教材证据，如：肱骨的形态特点" autocomplete="off">
+      <button id="btn-search" class="btn primary">检索</button>
+    </div>
+    <button id="btn-import" class="btn">导入教材</button>
+    <button id="btn-refresh" class="btn ghost" title="刷新书库">↻</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <span>教材库</span>
+      <span id="book-count" class="chip">0</span>
+    </div>
+    <div id="book-list" class="book-list"></div>
+    <div class="sidebar-foot" id="env-info"></div>
+  </aside>
+
+  <main class="main">
+    <section id="welcome" class="welcome">
+      <div class="welcome-card">
+        <h2>本地医学教材库</h2>
+        <p class="muted">索引保存在项目下的 <code>.medical_rag/library.sqlite3</code>，PDF 不会被上传。左侧选择教材即可预览、翻页、查看识别文本与处理状态。</p>
+        <div class="welcome-stats" id="welcome-stats"></div>
+        <div class="welcome-actions">
+          <button id="btn-welcome-open" class="btn primary" hidden>打开第一本教材</button>
+          <button id="btn-welcome-import" class="btn">导入第一本教材</button>
+          <button id="btn-welcome-guide" class="btn ghost">处理流程说明</button>
+        </div>
+        <details id="guide" class="guide">
+          <summary>处理流程都在做什么？</summary>
+          <ol>
+            <li><b>导入即检测</b>：带文字层的 PDF 跳过 OCR，直接从文字层解析入库（几秒）；图片型 PDF 才走下面的 OCR 流程。</li>
+            <li><b>OCR 文字识别</b>：用 rapidocr + PP-OCRv6 逐页识别图片型 PDF，输出文本框坐标。</li>
+            <li><b>版面/表格页检测</b>：PP-DocLayout 扫描全书，找出含表格的页面。</li>
+            <li><b>表格结构还原</b>：裁出表格区域，还原为带 rowspan 的 HTML 表格。</li>
+            <li><b>OCR 定向纠错</b>：修正“聘→腭、挠→桡、於→于”等在教材语境下无歧义的错字。</li>
+            <li><b>版面结构化</b>：xy-cut 分栏、段落重建、标题层级、页码校准（原书页 = PDF 页 − 偏移）。</li>
+            <li><b>建立检索索引</b>：把结构化 Markdown 写入 SQLite，供 pi / Codex / CLI 按页码引用。</li>
+          </ol>
+        </details>
+      </div>
+    </section>
+
+    <section id="detail" class="detail" hidden>
+      <div class="detail-head">
+        <img id="detail-cover" class="detail-cover" alt="教材封面">
+        <div class="detail-meta">
+          <h2 id="detail-title"></h2>
+          <div id="detail-subtitle" class="muted"></div>
+          <div id="status-grid" class="status-grid"></div>
+          <div class="actions">
+            <button id="btn-process" class="btn primary">处理教材</button>
+            <button id="btn-reindex" class="btn">重建索引</button>
+            <span id="detail-hint" class="hint"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="preview">
+        <div class="preview-toolbar">
+          <button id="btn-prev" class="btn small">‹ 上一页</button>
+          <div class="page-jump">
+            <label class="page-field">原书页 <input id="input-printed" class="page-input" type="number" min="1" inputmode="numeric"></label>
+            <span id="printed-total" class="muted">/ —</span>
+            <label class="page-field">PDF 页 <input id="input-pdf" class="page-input" type="number" min="1" inputmode="numeric"></label>
+            <span id="pdf-total" class="muted">/ —</span>
+          </div>
+          <button id="btn-next" class="btn small">下一页 ›</button>
+          <div class="zoom-controls">
+            <button id="btn-zoom-out" class="btn small" title="缩小（-）">−</button>
+            <button id="zoom-label" class="btn small zoom-label" title="恢复适应屏幕（0）">适应</button>
+            <button id="btn-zoom-in" class="btn small" title="放大（+，双击图片也可切换）">＋</button>
+          </div>
+          <button id="btn-fullscreen" class="btn small" title="全屏预览（F）">⛶ 全屏</button>
+          <label class="toggle"><input type="checkbox" id="toggle-text" checked> 识别文本</label>
+        </div>
+        <div class="preview-body">
+          <div class="page-stage" id="page-stage">
+            <div class="page-loading" id="page-loading">加载中…</div>
+            <img id="page-image" alt="教材页面">
+          </div>
+          <aside class="page-text" id="page-text"></aside>
+        </div>
+      </div>
+    </section>
+
+    <section id="search-results" class="search-results" hidden>
+      <div class="search-head">
+        <h2>检索结果 <span id="search-scope-label" class="muted"></span></h2>
+        <button id="btn-search-close" class="btn ghost small">关闭</button>
+      </div>
+      <div id="search-results-list" class="search-results-list"></div>
+    </section>
+  </main>
+</div>
+
+<!-- 任务面板 -->
+<div id="task-panel" class="task-panel" hidden>
+  <div class="task-head">
+    <strong>任务</strong>
+    <button id="btn-task-collapse" class="btn ghost small">收起</button>
+  </div>
+  <div id="task-list" class="task-list"></div>
+</div>
+
+<!-- 导入教材 -->
+<div id="import-modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>导入教材</h3>
+      <button class="btn ghost small" data-close="import-modal">✕</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-tab="upload">上传文件</button>
+      <button class="tab" data-tab="path">本地路径</button>
+    </div>
+    <div class="tab-body" data-tab="upload">
+      <div id="dropzone" class="dropzone">
+        <div class="dropzone-title">把 PDF 拖到这里</div>
+        <div class="muted">或点击选择文件（大文件会流式上传，可看到进度）</div>
+        <input type="file" id="file-input" accept=".pdf,application/pdf" hidden>
+      </div>
+      <div id="file-info" class="muted"></div>
+      <div class="muted">上传完成后会自动检测是否包含文字层，并推荐最快的入库方式。</div>
+      <label class="field">教材名称（可选）
+        <input id="upload-title" placeholder="默认使用文件名">
+      </label>
+      <div id="import-progress" class="progress-row" hidden>
+        <div class="progress"><div id="import-progress-bar" class="progress-bar"></div></div>
+        <div id="import-progress-text" class="muted"></div>
+      </div>
+    </div>
+    <div class="tab-body" data-tab="path" hidden>
+      <label class="field">PDF 路径
+        <span class="path-row">
+          <input id="path-input" placeholder="D:\医学教材\生理学.pdf">
+          <button id="btn-inspect" class="btn small" type="button">检测文字层</button>
+        </span>
+      </label>
+      <div id="inspect-result" class="inspect-result" hidden></div>
+      <label class="field">教材名称（可选）
+        <input id="path-title" placeholder="默认使用文件名">
+      </label>
+      <label class="toggle"><input type="checkbox" id="path-copy" checked> 复制到项目 res/ 目录（推荐，处理结果与 PDF 放在一起）</label>
+    </div>
+    <div class="modal-foot">
+      <button id="btn-import-submit" class="btn primary">开始导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 处理教材 -->
+<div id="process-modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>处理教材：<span id="process-book-name"></span></h3>
+      <button class="btn ghost small" data-close="process-modal">✕</button>
+    </div>
+    <div id="process-hint" class="muted"></div>
+    <label class="radio"><input type="radio" name="stage-mode" value="auto" checked> 自动（只跑未完成的阶段）</label>
+    <label class="radio"><input type="radio" name="stage-mode" value="manual"> 指定阶段</label>
+    <div id="stage-list" class="stage-list"></div>
+    <label class="toggle"><input type="checkbox" id="force-ocr"> 强制重跑 OCR（忽略已有结果，耗时较长）</label>
+    <details class="advanced">
+      <summary>高级选项</summary>
+      <label class="field">OCR 分辨率
+        <select id="dpi-select">
+          <option value="300" selected>300 DPI（推荐）</option>
+          <option value="200">200 DPI（更快）</option>
+        </select>
+      </label>
+      <label class="field">计算设备
+        <select id="device-select">
+          <option value="gpu" selected>GPU</option>
+          <option value="cpu">CPU</option>
+        </select>
+      </label>
+    </details>
+    <div class="modal-foot">
+      <button id="btn-process-submit" class="btn primary">开始处理</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+[project]
+name = "medical-book-rag"
+version = "0.2.0"
+description = "Local, citation-first medical book retrieval for agent platforms"
+requires-python = ">=3.10"
+dependencies = ["PyMuPDF>=1.24"]
+
+[project.scripts]
+medical-rag = "medical_rag.cli:main"
+medical-rag-mcp = "medical_rag.mcp_server:main"
+medical-rag-bridge = "medical_rag.bridge:main"
+medical-rag-web = "medical_rag.webapp:main"

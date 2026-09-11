@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+import fitz
+
+from .qa import match_book, plan_question, strip_book_mention
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
+
+
+def _tokens(value: str) -> list[str]:
+    value = value.lower()
+    # Latin words stay whole; Chinese text uses single characters so medical
+    # terms can still be found without a Chinese FTS tokenizer.
+    return re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]", value)
+
+
+def _normalise(value: str) -> str:
+    return re.sub(r"\s+", "", _correct_terms(value).lower())
+
+COMMON_OCR_FIXES = {
+    "系统解部学": "系统解剖学", "解部学": "解剖学", "骨膜含有丰富的血管神经和淋巴管": "骨膜含有丰富的血管、神经和淋巴管",
+    "肱骨头": "肱骨头", "胸锁乳突肌": "胸锁乳突肌", "迷走神经": "迷走神经",
+}
+
+def _correct_terms(value: str) -> str:
+    for wrong, right in COMMON_OCR_FIXES.items():
+        value = value.replace(wrong, right)
+    return value
+
+
+
+@dataclass
+class IngestReport:
+    title: str
+    path: str
+    pages: int
+    extractable_pages: int
+    image_only_pages: int
+    chunks: int
+    database: str
+
+    def __str__(self) -> str:
+        warning = "；注意：该 PDF 没有可提取文字层，当前未建立可检索文本索引" if self.image_only_pages else ""
+        return (
+            f"已处理《{self.title}》：总页数 {self.pages}，可提取文字页 {self.extractable_pages}，"
+            f"图片页 {self.image_only_pages}，文本块 {self.chunks}。数据库：{self.database}{warning}"
+        )
+
+
+class Library:
+    """Local multi-book evidence library."""
+
+    def __init__(self, db: Path | str | None = None):
+        self.db = Path(db or os.environ.get("MEDICAL_RAG_DB") or DEFAULT_DB).expanduser().resolve()
+        self.db.parent.mkdir(parents=True, exist_ok=True)
+        self.cx = sqlite3.connect(self.db)
+        self.cx.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def close(self) -> None:
+        self.cx.close()
+
+    def _init_schema(self) -> None:
+        self.cx.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS books (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                pages INTEGER NOT NULL,
+                extractable_pages INTEGER NOT NULL DEFAULT 0,
+                image_only_pages INTEGER NOT NULL DEFAULT 0,
+                added_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chunks (
+                rowid INTEGER PRIMARY KEY,
+                chunk_id TEXT NOT NULL UNIQUE,
+                book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                page INTEGER NOT NULL,
+                section TEXT NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_book_page ON chunks(book_id, page);
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text, section, content='chunks', content_rowid='rowid'
+            );
+            """
+        )
+        self.cx.commit()
+
+    def _delete_book_chunks(self, book_id: int) -> None:
+        rows = self.cx.execute("SELECT rowid FROM chunks WHERE book_id = ?", (book_id,)).fetchall()
+        for row in rows:
+            self.cx.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text, section) VALUES('delete', ?, '', '')", (row[0],))
+        self.cx.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
+
+    @staticmethod
+    def _chunk_page(text: str, max_chars: int = 1200) -> Iterable[str]:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+        if not paragraphs:
+            paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
+        buffer = ""
+        for para in paragraphs:
+            parts = [para]
+            if len(para) > max_chars:
+                parts = [p.strip() for p in re.split(r"(?<=[。！？；.!?;])", para) if p.strip()]
+            for part in parts:
+                if buffer and len(buffer) + len(part) + 1 > max_chars:
+                    yield buffer
+                    buffer = ""
+                buffer = f"{buffer} {part}".strip()
+        if buffer:
+            yield buffer
+
+    def ingest(self, pdf: Path | str, title: str | None = None) -> IngestReport:
+        path = Path(pdf).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(path)
+        if path.suffix.lower() != ".pdf":
+            raise ValueError("目前只支持 PDF 文件")
+
+        doc = fitz.open(path)
+        pages = len(doc)
+        title = title or path.stem
+        extractable = 0
+        image_only = 0
+        page_chunks: list[tuple[int, str, str]] = []
+        for page_number, page in enumerate(doc, 1):
+            text = page.get_text("text").strip()
+            if not text:
+                image_only += 1
+                continue
+            extractable += 1
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            section = lines[0][:160] if lines else f"第{page_number}页"
+            for chunk in self._chunk_page(text):
+                page_chunks.append((page_number, section, chunk))
+        doc.close()
+
+        existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(path),)).fetchone()
+        if existing:
+            book_id = existing[0]
+            self._delete_book_chunks(book_id)
+            self.cx.execute(
+                "UPDATE books SET title=?, pages=?, extractable_pages=?, image_only_pages=?, added_at=? WHERE id=?",
+                (title, pages, extractable, image_only, datetime.now(timezone.utc).isoformat(), book_id),
+            )
+        else:
+            cur = self.cx.execute(
+                "INSERT INTO books(title,path,pages,extractable_pages,image_only_pages,added_at) VALUES(?,?,?,?,?,?)",
+                (title, str(path), pages, extractable, image_only, datetime.now(timezone.utc).isoformat()),
+            )
+            book_id = cur.lastrowid
+
+        for ordinal, (page, section, text) in enumerate(page_chunks):
+            digest = hashlib.sha1(f"{path}:{page}:{ordinal}:{text}".encode("utf-8")).hexdigest()[:20]
+            cur = self.cx.execute(
+                "INSERT INTO chunks(chunk_id,book_id,page,section,text) VALUES(?,?,?,?,?)",
+                (digest, book_id, page, section, text),
+            )
+            self.cx.execute(
+                "INSERT INTO chunks_fts(rowid,text,section) VALUES(?,?,?)",
+                (cur.lastrowid, text, section),
+            )
+        self.cx.commit()
+        return IngestReport(title, str(path), pages, extractable, image_only, len(page_chunks), str(self.db))
+
+    def ingest_markdown_tree(self, text_dir: Path | str, title: str | None = None) -> IngestReport:
+        """Index processed Markdown while preserving chapter/page citations."""
+        root = Path(text_dir).expanduser().resolve()
+        files = sorted((root / "structured").glob("*.md")) if (root / "structured").exists() else sorted(root.rglob("*.md"))
+        files = [f for f in files if f.name not in {"README.md", "book.md"}]
+        if not files:
+            raise FileNotFoundError(f"未找到可索引 Markdown：{root}")
+        title = title or root.parent.name
+        existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(root),)).fetchone()
+        if existing:
+            book_id = existing[0]
+            self._delete_book_chunks(book_id)
+            self.cx.execute("UPDATE books SET title=?, pages=?, extractable_pages=?, image_only_pages=?, added_at=? WHERE id=?", (title, len(files), len(files), 0, datetime.now(timezone.utc).isoformat(), book_id))
+        else:
+            cur = self.cx.execute("INSERT INTO books(title,path,pages,extractable_pages,image_only_pages,added_at) VALUES(?,?,?,?,?,?)", (title, str(root), len(files), len(files), 0, datetime.now(timezone.utc).isoformat()))
+            book_id = cur.lastrowid
+        count = 0
+        max_source_page = 0
+        for file in files:
+            content = file.read_text(encoding="utf-8", errors="ignore")
+            chapter = file.stem
+            page = 0
+            heading = ""
+            buffer = []
+            def flush():
+                nonlocal count, buffer, page
+                text = " ".join(x.strip() for x in buffer if x.strip()).strip()
+                if not text: return
+                section = f"{chapter} · {heading}" if heading else chapter
+                digest = hashlib.sha1(f"{root}:{file}:{page}:{count}:{text}".encode("utf-8")).hexdigest()[:20]
+                cur2 = self.cx.execute("INSERT INTO chunks(chunk_id,book_id,page,section,text) VALUES(?,?,?,?,?)", (digest, book_id, page, section, text))
+                self.cx.execute("INSERT INTO chunks_fts(rowid,text,section) VALUES(?,?,?)", (cur2.lastrowid, text, section))
+                count += 1; buffer = []
+            for line in content.splitlines():
+                m = re.match(r"^## 原书第\s*(\d+)\s*页", line)
+                if m:
+                    flush(); page = int(m.group(1)); max_source_page = max(max_source_page, page); heading = ""; continue
+                hm = re.match(r"^#{3,6}\s+(.+?)\s*$", line)
+                if hm:
+                    # 节/小节标题：开始新块，并作为后续证据的 section 元数据
+                    flush(); heading = hm.group(1); buffer.append(heading); continue
+                if line.startswith("# ") or line.startswith("> ") or not line.strip():
+                    continue
+                if line.startswith("[图注/图例]"):
+                    buffer.append("[图注/图例] " + line[len("[图注/图例]"):].strip())
+                else:
+                    buffer.append(line)
+                if sum(len(x) for x in buffer) >= 1200: flush()
+            flush()
+        self.cx.commit()
+        page_count = max_source_page or len(files)
+        self.cx.execute("UPDATE books SET pages=?, extractable_pages=?, image_only_pages=0 WHERE id=?", (page_count, page_count, book_id))
+        self.cx.commit()
+        return IngestReport(title, str(root), page_count, page_count, 0, count, str(self.db))
+
+    def list_books(self) -> list[dict]:
+        return [dict(row) for row in self.cx.execute("SELECT * FROM books ORDER BY title")]
+
+    def get_book(self, book_id: int) -> dict | None:
+        row = self.cx.execute("SELECT * FROM books WHERE id=?", (int(book_id),)).fetchone()
+        return dict(row) if row else None
+
+    def chunks_for_page(self, book_id: int, page: int) -> list[dict]:
+        """按书 + 原书页码返回该页的全部证据块（用于网页预览正文）。"""
+        rows = self.cx.execute(
+            "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book "
+            "FROM chunks c JOIN books b ON b.id=c.book_id "
+            "WHERE c.book_id=? AND c.page=? ORDER BY c.rowid",
+            (int(book_id), int(page)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def page_range(self, book_id: int) -> tuple[int, int] | None:
+        row = self.cx.execute(
+            "SELECT MIN(page) AS lo, MAX(page) AS hi FROM chunks WHERE book_id=?",
+            (int(book_id),),
+        ).fetchone()
+        if row is None or row["lo"] is None:
+            return None
+        return int(row["lo"]), int(row["hi"])
+
+    def _python_search(self, query: str, limit: int, book_ids: set[int] | None = None) -> list[dict]:
+        q = _normalise(query)
+        # Prefer multi-character medical concepts over single Chinese
+        # characters. The latter are retained as a fallback for short OCR
+        # fragments and Latin terms.
+        from .qa import extract_concepts
+
+        concepts = [_normalise(term) for term in extract_concepts(query)]
+        tokens = [_normalise(t) for t in concepts if _normalise(t)]
+        if not tokens:
+            tokens = [_normalise(t) for t in _tokens(query) if t.strip()]
+        if not q or not tokens:
+            return []
+        sql = (
+            "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path "
+            "FROM chunks c JOIN books b ON b.id=c.book_id"
+        )
+        if book_ids:
+            placeholders = ",".join("?" for _ in book_ids)
+            rows = self.cx.execute(
+                f"{sql} WHERE c.book_id IN ({placeholders})", tuple(sorted(book_ids))
+            ).fetchall()
+        else:
+            rows = self.cx.execute(sql).fetchall()
+        scored: list[tuple[float, sqlite3.Row]] = []
+        # Character n-grams help recall OCR variants; concept coverage and
+        # metadata boosts prevent generic words such as “位置/特点” from
+        # dominating the ranking.
+        qgrams = {q[i:i + 2] for i in range(max(0, len(q) - 1))} or {q}
+        for row in rows:
+            text = _normalise(row["text"])
+            section = _normalise(row["section"])
+            book = _normalise(row["book"])
+            grams = {text[i:i + 2] for i in range(max(0, len(text) - 1))}
+            overlap = len(qgrams & grams) / max(len(qgrams), 1)
+            matched = [term for term in tokens if term in text]
+            coverage = len(matched) / max(len(tokens), 1)
+            hits = sum(text.count(term) for term in matched)
+            exact = 4.0 if q in text else 0.0
+            concept_boost = sum(min(text.count(term), 3) * 0.55 for term in matched)
+            section_boost = sum(0.7 for term in tokens if term in section)
+            book_boost = sum(0.25 for term in tokens if term in book)
+            score = overlap * 1.4 + coverage * 4.0 + hits * 0.08 + exact + concept_boost + section_boost + book_boost
+            # Require at least one meaningful concept match. This avoids
+            # returning a page only because a generic question phrase overlaps.
+            if matched and score > 0:
+                item = dict(row)
+                item["score"] = round(score, 4)
+                scored.append((score, item))
+        scored.sort(key=lambda x: (-x[0], x[1]["page"], x[1]["chunk_id"]))
+        return [item for _, item in scored[:limit]]
+
+    def _resolve_book_ids(self, book: int | str | None, books: list[dict] | None = None) -> set[int] | None:
+        """把 book 参数解析成书籍 id 集合：支持 id、数字字符串、书名/缩写（如“组胚”）。
+
+        None 表示不限定（全部教材）；显式给出但找不到时返回空集合。
+        """
+        if book is None:
+            return None
+        if isinstance(book, (set, frozenset, list, tuple)):  # 内部已解析好的 id 集合
+            return {int(item) for item in book}
+        rows = books if books is not None else self.list_books()
+        if isinstance(book, int) or (isinstance(book, str) and book.strip().isdigit()):
+            target = int(book)
+            return {target} if any(row["id"] == target for row in rows) else set()
+        text = str(book).strip()
+        if not text:
+            return None
+        matched = match_book(text, rows)
+        if matched:
+            return {matched[0]["id"]}
+        return {row["id"] for row in rows if text in row["title"]} or set()
+
+    def search(self, query: str, limit: int = 5, book: int | str | None = None) -> list[dict]:
+        limit = max(1, min(int(limit), 50))
+        book_ids = self._resolve_book_ids(book)
+        if book_ids is not None and not book_ids:
+            return []
+        results = self._python_search(query, limit, book_ids)
+        if results:
+            return results
+        # FTS5 remains useful for Latin terminology even when the local
+        # Chinese scorer cannot find a meaningful multi-character concept.
+        terms = [t for t in _tokens(query) if re.fullmatch(r"[a-z0-9_]+", t)]
+        if not terms:
+            return []
+        match = " OR ".join(f'"{t.replace(chr(34), "")}"' for t in terms)
+        if book_ids:
+            placeholders = ",".join("?" for _ in book_ids)
+            rows = self.cx.execute(
+                f"""SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path
+                   FROM chunks_fts f JOIN chunks c ON c.rowid=f.rowid
+                   JOIN books b ON b.id=c.book_id
+                   WHERE chunks_fts MATCH ? AND c.book_id IN ({placeholders})
+                   ORDER BY bm25(chunks_fts) LIMIT ?""",
+                (match, *sorted(book_ids), limit),
+            ).fetchall()
+        else:
+            rows = self.cx.execute(
+                """SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path
+                   FROM chunks_fts f JOIN chunks c ON c.rowid=f.rowid
+                   JOIN books b ON b.id=c.book_id
+                   WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?""",
+                (match, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_context(self, chunk_id: str, radius: int = 1, limit: int = 5) -> list[dict]:
+        """Return nearby chunks from the same book for cross-page answers."""
+        row = self.cx.execute("SELECT book_id,page FROM chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
+        if not row:
+            return []
+        radius = max(0, min(int(radius), 3))
+        limit = max(1, min(int(limit), 10))
+        rows = self.cx.execute(
+            """SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path
+               FROM chunks c JOIN books b ON b.id=c.book_id
+               WHERE c.book_id=? AND c.page BETWEEN ? AND ?
+               ORDER BY c.page,c.rowid LIMIT ?""",
+            (row["book_id"], row["page"] - radius, row["page"] + radius, limit),
+        ).fetchall()
+        return [dict(item) for item in rows]
+
+    def answer_question(self, question: str, limit: int = 6, book: int | str | None = None) -> dict:
+        """Create a citation-first evidence pack for an exam question.
+
+        This method intentionally does not invent a final medical answer. In
+        MCP mode the calling agent uses this evidence pack to write the answer
+        and cite the returned pages.
+
+        ``book`` 可显式限定教材（id / 书名 / 缩写）；不传时会自动识别题干里点名
+        的教材（如“组胚里…”），并把它从题干中剥离后再抽取概念。
+        """
+        books = self.list_books()
+        scoped_question = question
+        book_ids = self._resolve_book_ids(book, books) if book is not None else None
+        if book_ids is not None and not book_ids:
+            return {"status": "invalid_book", "message": f"未找到教材：{book}"}
+        scope = None
+        mention = match_book(question, books)
+        if mention is not None and (book_ids is None or mention[0]["id"] in book_ids):
+            matched_book, matched_text = mention
+            scoped_question = strip_book_mention(question, matched_text)
+            if book_ids is None:
+                book_ids = {matched_book["id"]}
+            scope = {
+                "source": "explicit" if book is not None else "question",
+                "book_id": matched_book["id"],
+                "title": matched_book["title"],
+                "mention": matched_text,
+            }
+        elif book_ids is not None:
+            row = next((item for item in books if item["id"] in book_ids), None)
+            scope = {
+                "source": "explicit",
+                "book_id": next(iter(book_ids)) if len(book_ids) == 1 else None,
+                "title": row["title"] if row else str(book),
+                "mention": None,
+            }
+
+        plan = plan_question(scoped_question)
+        if not plan.question:
+            return {"status": "invalid_question", "message": "题目不能为空"}
+
+        limit = max(1, min(int(limit), 20))
+        merged: dict[str, dict] = {}
+        for query_index, query in enumerate(plan.queries):
+            for rank, result in enumerate(self.search(query, max(limit * 2, 8), book=book_ids), start=1):
+                item = dict(result)
+                # Earlier passes use the full question and should dominate;
+                # single-concept passes are only a recall fallback and must not
+                # outrank a result matching the whole question.
+                pass_weights = [1.20, 0.95, 0.38, 0.28]
+                pass_weight = pass_weights[query_index] if query_index < len(pass_weights) else 0.22
+                score = float(item.get("score", 0.0)) * pass_weight + max(0.0, 0.18 - rank * 0.01)
+                item["retrieval_score"] = round(score, 4)
+                old = merged.get(item["chunk_id"])
+                if old is None or score > old["retrieval_score"]:
+                    merged[item["chunk_id"]] = item
+
+        evidence = sorted(
+            merged.values(),
+            key=lambda item: (-item["retrieval_score"], item["page"], item["chunk_id"]),
+        )[:limit]
+        for item in evidence:
+            item["context"] = self.get_context(item["chunk_id"], radius=1, limit=5)
+
+        if plan.question_type == "choice":
+            guidance = "逐项核对题干和选项，不能仅凭相似词判断；答案必须引用教材证据。"
+        elif plan.question_type == "compare":
+            guidance = "按比较维度组织答案，例如组成、位置、结构、功能和临床意义。"
+        elif plan.question_type == "definition":
+            guidance = "先给出教材定义，再补充位置、组成、特点或作用。"
+        elif plan.question_type == "why":
+            guidance = "按‘结构/机制 → 结果’解释原因，并区分教材原文与推断。"
+        else:
+            guidance = "围绕题干逐点作答；如果证据不足，应明确说明知识库未检索到依据。"
+        if scope:
+            guidance = f"{guidance} 检索范围已限定为《{scope['title']}》。"
+
+        result = {
+            "status": "evidence_found" if evidence else "no_evidence",
+            "plan": plan.as_dict(),
+            "evidence": evidence,
+            "answer_guidance": guidance,
+            "citation_rule": "引用《书名》、原书页码、章节和 chunk_id；不得把未检索到的内容说成教材结论。",
+        }
+        if scope:
+            result["book_scope"] = scope
+        return result
+
+    def get_chunk(self, chunk_id: str) -> dict | None:
+        row = self.cx.execute(
+            "SELECT c.*,b.title AS book,b.path FROM chunks c JOIN books b ON b.id=c.book_id WHERE c.chunk_id=?",
+            (chunk_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
