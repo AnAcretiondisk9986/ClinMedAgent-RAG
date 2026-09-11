@@ -101,6 +101,67 @@ class CheckEnvironmentTests(unittest.TestCase):
             self.assertIn("结论", text)
 
 
+class CompactTests(unittest.TestCase):
+    """重建索引会累积空闲页；optimize + VACUUM 才能回收。"""
+
+    def _churned_library(self, root: Path, rounds: int = 6) -> Path:
+        structured = root / "book" / "processed_v3" / "structured"
+        structured.mkdir(parents=True, exist_ok=True)
+        body = "".join(
+            f"## 原书第 {page} 页\n\n骨膜含有丰富的血管和神经，关节囊由纤维层和滑膜层构成。\n\n"
+            for page in range(1, 40)
+        )
+        (structured / "01-章节.md").write_text(f"# 第一章\n\n{body}", encoding="utf-8")
+        db = root / "library.sqlite3"
+        library = Library(db)
+        try:
+            for _ in range(rounds):
+                library.ingest_markdown_tree(root / "book" / "processed_v3", "测试教材")
+        finally:
+            library.close()
+        return db
+
+    def test_compact_reclaims_space_and_keeps_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = self._churned_library(root)
+            before_bytes = db.stat().st_size
+
+            result = doctor.compact(root, db)
+
+            self.assertTrue(result["compacted"])
+            self.assertGreater(result["saved_bytes"], 0)
+            self.assertLess(result["after_bytes"], before_bytes)
+            self.assertEqual(db.stat().st_size, result["after_bytes"])
+            self.assertEqual(result["chunks"], 39)
+            self.assertTrue(result["fts_integrity"])
+
+            library = Library(db)
+            try:
+                self.assertTrue(library.fts_integrity_ok())
+                self.assertTrue(library.search("骨膜", 2))
+            finally:
+                library.close()
+
+    def test_compact_is_safe_on_clean_database(self) -> None:
+        """已经干净的库不能报错，也不能变坏。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = self._churned_library(root, rounds=1)
+            first = doctor.compact(root, db)
+            second = doctor.compact(root, db)
+            self.assertTrue(second["compacted"])
+            self.assertTrue(second["fts_integrity"])
+            self.assertLessEqual(second["after_bytes"], first["after_bytes"])
+            self.assertEqual(second["chunks"], 39)
+
+    def test_compact_without_database_reports_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = doctor.compact(Path(tmp))
+            self.assertFalse(result["compacted"])
+            self.assertIn("不存在", result["reason"])
+
+
 class InterpreterPackageTests(unittest.TestCase):
     def test_current_interpreter_reads_metadata(self) -> None:
         found = doctor.interpreter_package_versions(sys.executable, ("PyMuPDF",))

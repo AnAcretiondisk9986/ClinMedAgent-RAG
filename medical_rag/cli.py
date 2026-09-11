@@ -3,20 +3,42 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from .doctor import check_environment, format_report, repair
+from .doctor import check_environment, compact, format_report, repair
 from .library import Library
 
 
+def _human_mb(size: int) -> str:
+    return f"{size / 1024 / 1024:.2f} MB"
+
+
 def _run_doctor(args: argparse.Namespace) -> None:
-    if args.repair:
-        result = repair(args.root, args.db)
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        elif result.get("repaired"):
-            print(f"FTS 索引已重建：{result['chunks']} 个证据块，一致性检查通过。")
-        else:
-            print(f"未修复：{result.get('reason') or '重建后仍不一致'}")
-        raise SystemExit(0 if result.get("repaired") else 1)
+    """维护动作（--repair / --compact）优先，否则跑环境自检。"""
+    if args.repair or args.compact:
+        exit_code = 0
+        if args.repair:
+            result = repair(args.root, args.db)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            elif result.get("repaired"):
+                print(f"FTS 索引已重建：{result['chunks']} 个证据块，一致性检查通过。")
+            else:
+                print(f"未修复：{result.get('reason') or '重建后仍不一致'}")
+            exit_code = 0 if result.get("repaired") else 1
+        if args.compact:
+            result = compact(args.root, args.db)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            elif result.get("compacted"):
+                print(
+                    f"索引库已压缩：{_human_mb(result['before_bytes'])} → "
+                    f"{_human_mb(result['after_bytes'])}（释放 {_human_mb(result['saved_bytes'])}），"
+                    f"{result['chunks']} 个证据块，一致性 {'通过' if result['fts_integrity'] else '未通过'}"
+                )
+            else:
+                print(f"未压缩：{result.get('reason')}")
+            if not result.get("compacted"):
+                exit_code = 1
+        raise SystemExit(exit_code)
     report = check_environment(args.root, args.db, deep=args.deep)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -50,6 +72,11 @@ def main() -> None:
     doctor.add_argument("--db", type=Path, help="library.sqlite3 路径")
     doctor.add_argument("--deep", action="store_true", help="额外启动子解释器验证 OCR/Paddle 依赖可导入（较慢）")
     doctor.add_argument("--repair", action="store_true", help="重建 FTS 索引，修复 chunks 与 chunks_fts 不一致")
+    doctor.add_argument(
+        "--compact",
+        action="store_true",
+        help="压缩索引库（FTS optimize + VACUUM），回收重建索引后累积的空闲页",
+    )
     doctor.add_argument("--json", action="store_true", help="以 JSON 输出")
     args = parser.parse_args()
 

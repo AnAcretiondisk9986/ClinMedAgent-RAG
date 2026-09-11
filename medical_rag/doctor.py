@@ -369,3 +369,43 @@ def repair(root: Path | str | None = DEFAULT_ROOT, db: Path | str | None = None)
     finally:
         library.close()
     return {"repaired": bool(after), "before_ok": before, "after_ok": after, "chunks": chunks, "db": str(db_path)}
+
+
+def compact(root: Path | str | None = DEFAULT_ROOT, db: Path | str | None = None) -> dict[str, Any]:
+    """压缩索引库：FTS5 ``optimize``（合并段）+ ``VACUUM``（回收空闲页）。
+
+    重建索引会反复删除/插入整本书的块，FTS5 段与 SQLite 空闲页都会累积。
+    实测重建后的库 22.6 MB，经 optimize + VACUUM 回到 15.5 MB；注意**只跑
+    optimize 反而会先变大**（合并段时临时扩张），必须再做 VACUUM 才回收。
+
+    VACUUM 需要临时占用与库等量的磁盘空间，不要在磁盘将满时执行。
+    """
+    from .library import Library
+
+    _, db_path = _resolve_paths(root, db)
+    if not db_path.exists():
+        return {"compacted": False, "reason": f"索引库不存在：{db_path}"}
+    before = db_path.stat().st_size
+    library = Library(db_path)
+    try:
+        # WAL 里的内容要先落盘，VACUUM 看到的才是最终大小
+        library.cx.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        library.cx.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
+        library.cx.execute("INSERT INTO chunks_fts_ngram(chunks_fts_ngram) VALUES('optimize')")
+        library.cx.commit()
+        library.cx.execute("VACUUM")
+        library.cx.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        chunks = int(library.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        integrity = library.fts_integrity_ok()
+    finally:
+        library.close()
+    after = db_path.stat().st_size
+    return {
+        "compacted": True,
+        "db": str(db_path),
+        "before_bytes": int(before),
+        "after_bytes": int(after),
+        "saved_bytes": max(0, int(before - after)),
+        "chunks": chunks,
+        "fts_integrity": integrity,
+    }
