@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import socket
 import tempfile
@@ -555,6 +557,96 @@ class SafeFileNameTests(unittest.TestCase):
     def test_trailing_dots_and_spaces_removed(self) -> None:
         self.assertEqual(safe_file_name("骨学 ...pdf"), "骨学.pdf")
         self.assertEqual(safe_file_name("骨学 .pdf"), "骨学.pdf")
+
+
+class AuthTests(unittest.TestCase):
+    """非本机监听时的访问令牌：header / ?token= / Cookie 三条路径。"""
+
+    TOKEN = "s3cret-token"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="medrag_auth_"))
+        self.server = create_server("127.0.0.1", 0, root=self.tmp, token=self.TOKEN)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def request(self, path: str, method: str = "GET", payload=None, headers=None):
+        data = None
+        request_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            request_headers.setdefault("Content-Type", "application/json")
+        request = urllib.request.Request(
+            self.base + path, data=data, method=method, headers=request_headers
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, dict(error.headers), error.read()
+            finally:
+                error.close()
+
+    def test_api_requires_token(self) -> None:
+        status, _, _ = self.request("/api/books")
+        self.assertEqual(status, 401)
+
+    def test_header_token_is_accepted(self) -> None:
+        status, _, body = self.request("/api/books", headers={"X-Auth-Token": self.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_query_token_is_accepted_and_sets_cookie(self) -> None:
+        """封面/预览图用 <img src> 加载，无法带自定义头，所以必须支持 Cookie。"""
+        status, headers, _ = self.request(f"/?token={self.TOKEN}")
+        self.assertEqual(status, 200)
+        cookie = headers.get("Set-Cookie", "")
+        self.assertIn("medrag_token=", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("HttpOnly", cookie)
+
+    def test_cookie_token_is_accepted(self) -> None:
+        status, _, _ = self.request(
+            "/api/overview", headers={"Cookie": f"medrag_token={self.TOKEN}"}
+        )
+        self.assertEqual(status, 200)
+
+    def test_wrong_token_is_rejected(self) -> None:
+        status, _, _ = self.request("/api/books", headers={"X-Auth-Token": "nope"})
+        self.assertEqual(status, 401)
+
+    def test_image_endpoint_requires_token(self) -> None:
+        status, _, _ = self.request("/api/books/whatever/cover.png")
+        self.assertEqual(status, 401)
+
+    def test_mutating_endpoint_requires_token(self) -> None:
+        status, _, _ = self.request("/api/process", "POST", payload={"book_id": "x"})
+        self.assertEqual(status, 401)
+
+    def test_static_assets_need_no_token(self) -> None:
+        status, _, _ = self.request("/static/app.js")
+        self.assertEqual(status, 200)
+
+
+class LoopbackGuardTests(unittest.TestCase):
+    def test_is_loopback(self) -> None:
+        for host in ("127.0.0.1", "::1", "localhost", "localhost.", "127.0.0.5"):
+            self.assertTrue(webapp_module.is_loopback(host), host)
+        for host in ("0.0.0.0", "::", "192.168.1.10", "example.com"):
+            self.assertFalse(webapp_module.is_loopback(host), host)
+
+    def test_main_refuses_remote_host_without_allow_remote(self) -> None:
+        """默认禁止监听非本机地址，防止局域网裸奔。"""
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                webapp_module.main(["--host", "0.0.0.0", "--no-browser"])
 
 
 class StyleGuardTests(unittest.TestCase):

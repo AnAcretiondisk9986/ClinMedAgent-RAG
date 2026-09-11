@@ -34,10 +34,13 @@ API 概览：
 from __future__ import annotations
 
 import argparse
+import hmac
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -57,6 +60,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17173  # 冷门端口，避开 8000/8080/5000 等常用端口
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 DEFAULT_ROOT = PACKAGE_ROOT
+AUTH_COOKIE = "medrag_token"
+AUTH_HINT = "缺少或错误的访问令牌；请使用启动时打印的带 ?token= 的地址"
 MAX_JSON_BODY = 8 * 1024 * 1024
 # 单次上传的字节上限（可用 MEDICAL_RAG_MAX_UPLOAD 覆盖，单位字节）
 MAX_UPLOAD_SIZE = int(os.environ.get("MEDICAL_RAG_MAX_UPLOAD") or 2 * 1024 * 1024 * 1024)
@@ -94,6 +99,16 @@ def safe_file_name(name: str, fallback: str = "教材.pdf") -> str:
     if body.upper() in WINDOWS_RESERVED_NAMES:
         body = f"{body}_"
     return f"{body}.pdf"
+
+
+def is_loopback(host: str) -> bool:
+    """host 是否只监听本机（127.0.0.1 / ::1 / localhost）。"""
+    if str(host).strip().lower() in ("localhost", "localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(str(host).strip()).is_loopback
+    except ValueError:
+        return False
 
 
 def book_lock_key(directory: Path | str) -> str:
@@ -154,10 +169,12 @@ def render_page_png(app: "WebApp", book: dict[str, Any], page_no: int, width: in
 class WebApp:
     """站点状态：教材扫描缓存、任务管理器、渲染锁。"""
 
-    def __init__(self, root: Path | str = DEFAULT_ROOT, db: Path | str | None = None):
+    def __init__(self, root: Path | str = DEFAULT_ROOT, db: Path | str | None = None, token: str = ""):
         self.root = Path(root).expanduser().resolve()
         self.db = Path(db).expanduser().resolve() if db else self.root / ".medical_rag" / "library.sqlite3"
         self.cache_dir = self.root / ".medical_rag" / "web_cache"
+        # 非空时启用访问令牌（非本机监听必须启用；本机监听默认为空 = 不鉴权）
+        self.token = str(token or "")
         self.tasks = TaskManager()
         self.render_lock = threading.Lock()
         self._books_lock = threading.Lock()
@@ -205,6 +222,7 @@ class WebApp:
 class Handler(BaseHTTPRequestHandler):
     server_version = "MedicalRAGWeb/0.1"
     protocol_version = "HTTP/1.1"
+    _auth_cookie = ""
 
     @property
     def app(self) -> WebApp:
@@ -214,12 +232,45 @@ class Handler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):
             super().log_message(fmt, *args)
 
+    # --------------------------------------------------------------- 鉴权
+    def _cookie_token(self) -> str:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == AUTH_COOKIE:
+                return urllib.parse.unquote(value)
+        return ""
+
+    def _authorized(self, query: dict[str, list[str]]) -> bool:
+        """令牌可来自 X-Auth-Token 头、?token= 查询参数或 Cookie。
+
+        查询参数/ Cookie 是必需的：封面、预览图和 PDF 都用 <img src> / 链接加载，
+        无法附加自定义请求头。
+        """
+        token = self.app.token
+        if not token:
+            return True
+        candidates = (
+            self.headers.get("X-Auth-Token") or "",
+            (query.get("token") or [""])[0],
+            self._cookie_token(),
+        )
+        return any(value and hmac.compare_digest(str(value), token) for value in candidates)
+
+    def _remember_token(self, query: dict[str, list[str]]) -> None:
+        """带 ?token= 访问时种下 Cookie，后续静态资源/图片/PDF 自动携带。"""
+        if self.app.token and (query.get("token") or [""])[0]:
+            value = urllib.parse.quote(self.app.token)
+            # SameSite=Strict 让跨站请求不携带该 Cookie，作为变更类接口的 CSRF 防护
+            self._auth_cookie = f"{AUTH_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict"
+
     # ------------------------------------------------------------- 响应工具
     def _send(self, status: int, body: bytes, content_type: str, cache: str = "no-store", extra: dict[str, str] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache)
+        if self._auth_cookie:
+            self.send_header("Set-Cookie", self._auth_cookie)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -289,12 +340,18 @@ class Handler(BaseHTTPRequestHandler):
             path = urllib.parse.unquote(parsed.path)
             query = urllib.parse.parse_qs(parsed.query)
 
-            if path in ("/", "/index.html"):
-                return self._serve_static("index.html")
+            # 静态资源不包含数据，先放行，避免首次访问时 Cookie 还未种下
             if path.startswith("/static/"):
                 return self._serve_static(path[len("/static/"):])
             if path == "/favicon.ico":
                 return self._send(204, b"", "image/x-icon")
+
+            if not self._authorized(query):
+                return self._send_error_json(401, AUTH_HINT)
+            self._remember_token(query)
+
+            if path in ("/", "/index.html"):
+                return self._serve_static("index.html")
 
             if path == "/api/overview":
                 port = getattr(self.server, "server_port", None)
@@ -436,8 +493,13 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ POST
     def do_POST(self) -> None:  # noqa: N802
         try:
-            path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+            parsed = urllib.parse.urlparse(self.path)
+            path = urllib.parse.unquote(parsed.path)
             parts = [segment for segment in path.split("/") if segment]
+            if not self._authorized(urllib.parse.parse_qs(parsed.query)):
+                # 请求体未读，关闭连接避免 HTTP/1.1 流水线错位
+                self.close_connection = True
+                return self._send_error_json(401, AUTH_HINT)
             if path == "/api/import":
                 return self._post_import()
             if path == "/api/import/begin":
@@ -654,8 +716,12 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------- PUT
     def do_PUT(self) -> None:  # noqa: N802
         try:
-            path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+            parsed = urllib.parse.urlparse(self.path)
+            path = urllib.parse.unquote(parsed.path)
             parts = [segment for segment in path.split("/") if segment]
+            if not self._authorized(urllib.parse.parse_qs(parsed.query)):
+                self.close_connection = True
+                return self._send_error_json(401, AUTH_HINT)
             if parts[:3] == ["api", "import", "upload"] and len(parts) == 4:
                 return self._put_upload(parts[3])
             self._drain_body()
@@ -791,8 +857,9 @@ def create_server(
     db: Path | str | None = None,
     verbose: bool = False,
     port_attempts: int = 20,
+    token: str = "",
 ) -> MedicalHTTPServer:
-    app = WebApp(root, db)
+    app = WebApp(root, db, token=token)
     last_error: OSError | None = None
     for offset in range(port_attempts):
         try:
@@ -807,7 +874,17 @@ def create_server(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="本地医学教材工作台网站")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="监听地址（默认 127.0.0.1）")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="监听地址（默认 127.0.0.1；非本机地址需 --allow-remote）")
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="允许监听非本机地址（危险：局域网可读全部 PDF/教材文本并触发 OCR），自动启用访问令牌",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="访问令牌（默认取 MEDICAL_RAG_TOKEN；监听非本机地址时未提供则自动生成并打印）",
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -823,15 +900,36 @@ def main(argv: list[str] | None = None) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
-    server = create_server(args.host, args.port, args.root or DEFAULT_ROOT, args.db, verbose=args.verbose)
+    loopback = is_loopback(args.host)
+    if not loopback and not args.allow_remote:
+        parser.error(
+            f"--host {args.host} 会监听非本机地址，局域网内任何人都能读取全部 PDF 与教材文本、"
+            "上传文件并触发 OCR/GPU 任务。\n"
+            "如确实需要，请显式加上 --allow-remote（将自动启用访问令牌）。"
+        )
+
+    token = str(args.token or os.environ.get("MEDICAL_RAG_TOKEN") or "").strip()
+    generated = False
+    if not token and not loopback:
+        token = secrets.token_urlsafe(24)
+        generated = True
+
+    server = create_server(
+        args.host, args.port, args.root or DEFAULT_ROOT, args.db, verbose=args.verbose, token=token
+    )
     host, port = server.server_address[0], server.server_address[1]
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    url = f"http://{display_host}:{port}/"
+    suffix = f"?token={urllib.parse.quote(token)}" if token else ""
+    url = f"http://{display_host}:{port}/{suffix}"
     info = interpreter_info(Path(args.root or DEFAULT_ROOT).resolve())
 
     print("=" * 62)
     print("  本地医学教材工作台")
     print(f"  地址：{url}")
+    if token:
+        print(f"  访问令牌：{token}" + ("（自动生成，本次启动有效）" if generated else ""))
+        if not loopback:
+            print("  ⚠ 已监听非本机地址：局域网内需凭令牌访问，请勿对外网暴露")
     print(f"  项目：{server.app.root}")
     print(f"  索引库：{server.app.db}")
     print(f"  Python：{info['python']}")

@@ -84,6 +84,28 @@ Windows 下也可以直接双击项目根目录的 `start_web.bat`：脚本会�
 
 后端为 Python 标准库 HTTP 服务（无额外依赖），处理时自动调用 `.venv-ocr` 与 `.venv-ocr312`；环境变量 `MEDICAL_RAG_WEB_PORT` 可指定默认端口，`MEDICAL_RAG_OCR_PYTHON` / `MEDICAL_RAG_PADDLE_PYTHON` 可覆盖解释器。API 一览见 `medical_rag/webapp.py` 顶部文档字符串。
 
+### 监听地址与访问令牌
+
+默认只监听 `127.0.0.1`，**不启用鉴权**（仅本机可访问，等同于本机权限）。
+
+> ⚠️ **`--host 0.0.0.0` 的风险**：该服务没有任何账号体系，一旦监听非本机地址，
+> 同一局域网内的任何人都可以读取全部 PDF 与教材文本、上传任意文件、触发 OCR/GPU
+> 任务并查看任务日志。因此**默认禁止**监听非本机地址，必须显式加
+> `--allow-remote` 才会启动，且此时会自动启用访问令牌。
+
+启用令牌后，服务启动时会打印带令牌的地址，直接点开即可（令牌会种成
+`SameSite=Strict` 的 Cookie，所以封面、预览图和 PDF 都能正常加载）。
+非浏览器调用可改用 `X-Auth-Token` 请求头或 `?token=` 查询参数：
+
+```bash
+python -m medical_rag.webapp --host 0.0.0.0 --allow-remote          # 自动生成令牌
+python -m medical_rag.webapp --host 0.0.0.0 --allow-remote --token 你的令牌
+MEDICAL_RAG_TOKEN=你的令牌 python -m medical_rag.webapp --host 0.0.0.0 --allow-remote
+curl -H "X-Auth-Token: 你的令牌" http://192.168.1.10:17173/api/books
+```
+
+即使用令牌，也不要把端口映射到公网。
+
 > 新版 `tools_structure_v3.py` 支持任意教材：`--book-dir res/生理学`，章节优先读 `<book-dir>/chapters.json`，没有就自动检测章标题（跳过目录页），检测不到则按单章输出。
 
 ## 文字层 PDF（跳过 OCR）
