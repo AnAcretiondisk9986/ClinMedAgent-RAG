@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,11 +21,69 @@ QUESTION_STOPWORDS = {
 # and “并殖吸虫” stay intact.
 TRAILING_CONNECTIVES = set("由使令把被将所该此那这并而且则")
 
-# 缩写匹配时忽略的通用词，避免“医学统计学”误命中《医学免疫学》之类
-BOOK_MENTION_STOPWORDS = {
-    "医学", "临床", "基础", "现代", "实用", "中国", "实验", "大学",
-    "教材", "图谱", "人卫", "科学", "技术", "规划", "高等", "院校",
+# 缩写匹配时忽略的通用词表已被显式别名表（DEFAULT_BOOK_ALIASES）取代：
+# 旧实现要在这里逐个屏蔽“医学/临床/实验”等词，仍然拦不住“系统/组织”这类
+# 普通医学词；现在只认白名单，不再需要黑名单。
+
+# 教材缩写白名单：缩写 → 能指代的书名子串（可多个）。
+#
+# 旧实现根据书名自动生成任意 2–4 字缩写，结果把普通医学词当成书名：
+#   “神经系统的组成” → “系统” → 误限《系统解剖学》
+#   “组织的分类”     → “组织” → 误限《组织学与胚胎学》
+# 现在只认下面的显式别名；不在表里的缩写一律当作没有点名教材，保持全库检索。
+DEFAULT_BOOK_ALIASES: dict[str, tuple[str, ...]] = {
+    "系解": ("系统解剖学",),
+    "局解": ("局部解剖学",),
+    "神解": ("神经解剖学",),
+    "组胚": ("组织学与胚胎学", "组织胚胎学"),
+    "解胚": ("解剖学与胚胎学",),
+    "生理": ("生理学",),
+    "病生": ("病理生理学",),
+    "生化": ("生物化学",),
+    "病理": ("病理学",),
+    "药理": ("药理学",),
+    "微生": ("微生物学",),
+    "免疫": ("免疫学",),
+    "寄生": ("寄生虫学",),
+    "诊断": ("诊断学",),
+    "内科": ("内科学",),
+    "外科": ("外科学",),
+    "妇产": ("妇产科学",),
+    "儿科": ("儿科学",),
 }
+ALIASES_FILE = "aliases.json"
+
+# 缩写必须作为独立引用出现，否则“生理功能”“免疫应答”这类常见词会被当成书名。
+SCOPE_MARKERS = ("里", "中", "内", "的", "这", "那", "该", "本", "书", "教材", "课")
+REFERENCE_LEADS = ("请问", "依据", "按照", "参见", "参考", "根据", "翻到", "见")
+
+CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+# 低于这个置信度就不自动限定教材范围，改回全库检索（安全侧）
+SCOPE_MIN_CONFIDENCE = "medium"
+
+
+def load_book_aliases(base_dir: Path | str | None = None) -> dict[str, tuple[str, ...]]:
+    """内置缩写表 + 可选自定义 ``aliases.json``（路径可用 MEDICAL_RAG_ALIASES 覆盖）。
+
+    自定义项覆盖同名内置项，方便学生自己加教材：
+    ``{"影像": ["医学影像学"], "口组": ["口腔组织病理学"]}``
+    """
+    aliases = {alias: tuple(targets) for alias, targets in DEFAULT_BOOK_ALIASES.items()}
+    override = os.environ.get("MEDICAL_RAG_ALIASES")
+    path = Path(override).expanduser() if override else (Path(base_dir) / ALIASES_FILE if base_dir else None)
+    if path is None or not path.exists():
+        return aliases
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return aliases
+    if isinstance(data, dict):
+        for alias, targets in data.items():
+            if isinstance(targets, str):
+                targets = [targets]
+            if isinstance(targets, (list, tuple)) and targets:
+                aliases[str(alias).strip()] = tuple(str(target) for target in targets)
+    return aliases
 
 QUESTION_PATTERNS: list[tuple[str, str]] = [
     ("choice", r"(?:^|[\n\s])\s*[A-DＡ-Ｄ][\.、．\)]"),
@@ -143,23 +203,89 @@ def _book_candidates(book: dict) -> list[str]:
 
 
 def _is_subsequence(needle: str, haystack: str) -> bool:
-    """needle 的字符是否按顺序出现在 haystack 中（如“组胚” → “组织学与胚胎学”）。"""
+    """needle 的字符是否按顺序出现在 haystack 中。
+
+    保留给测试与外部调用；**不再用于教材识别**（旧实现靠它把“系统”“组织”这类
+    普通医学词当成书名缩写）。
+    """
     iterator = iter(haystack)
     return all(char in iterator for char in needle)
 
 
-def match_book(text: str, books: list[dict]) -> tuple[dict, str] | None:
-    """从题干里识别教材，返回 (book, 命中的原文片段)。
+def _aliases_for(book: dict, aliases: dict[str, tuple[str, ...]]) -> list[str]:
+    """这本书能被哪些显式缩写指代（缩写表按书名/目录名子串匹配）。"""
+    candidates = _book_candidates(book)
+    if not candidates:
+        return []
+    return [
+        alias
+        for alias, targets in aliases.items()
+        if any(target in candidate for candidate in candidates for target in targets)
+    ]
+
+
+def _alias_is_standalone(text: str, index: int, length: int) -> bool:
+    """缩写是否作为**独立引用**出现，而不是嵌在“生理功能”这类普通词里。
+
+    以下算独立引用：
+      - 后面紧跟范围标记：“组胚里…”“系解中…”“组胚的上皮组织”
+      - 两侧都不是汉字：“《组胚》”“用 组胚 查”、行首或行尾
+      - 前面是引用语：“请问组胚…”“依据系解…”
+    其余情况（如“生理功能有哪些”）一律不算——宁可退回全库检索，也不能错误限域。
+    """
+    before = text[index - 1] if index > 0 else ""
+    after = text[index + length] if index + length < len(text) else ""
+
+    def is_han(char: str) -> bool:
+        return bool(char) and bool(re.fullmatch(r"[\u4e00-\u9fff]", char))
+
+    if after and after in SCOPE_MARKERS:
+        return True
+    if not is_han(before) and not is_han(after):
+        return True
+    prefix = text[:index]
+    return any(prefix.endswith(lead) for lead in REFERENCE_LEADS)
+
+
+@dataclass(frozen=True)
+class BookMatch:
+    """题干里识别到的教材及其置信度。"""
+
+    book: dict
+    mention: str
+    confidence: str  # high（完整书名/主体/目录名）| medium（显式缩写）
+    reason: str
+
+    def as_dict(self) -> dict:
+        return {
+            "book_id": self.book.get("id"),
+            "title": self.book.get("title"),
+            "mention": self.mention,
+            "confidence": self.confidence,
+            "reason": self.reason,
+        }
+
+
+def match_book_ex(
+    text: str,
+    books: list[dict],
+    aliases: dict[str, tuple[str, ...]] | None = None,
+) -> BookMatch | None:
+    """从题干里识别教材，返回带置信度的 :class:`BookMatch`。
 
     两级匹配：
-      1) 强匹配：完整书名 / 书名主体 / 目录名作为子串出现，如同 “系统解剖学中骨的构造”；
-      2) 弱匹配（仅当强匹配无结果）：以书名主体首字开头的 2–4 字缩写，
-         如 “组胚” → 《组织学与胚胎学》，“系解” → 《系统解剖学》。
+      1) **强匹配**（high）：完整书名 / 书名主体 / 目录名作为子串出现，
+         如“系统解剖学中骨的构造”；
+      2) **缩写匹配**（medium）：只有 ``aliases`` 白名单里的缩写才算，
+         且必须作为独立引用出现（见 :func:`_alias_is_standalone`）。
     多个教材同时命中时不强行路由（返回 None），交给全局检索排序。
+
+    不再有低置信度的自动子序列匹配：匹配不到就是 None，由调用方全库检索。
     """
     text = str(text or "")
     if not text or not books:
         return None
+    aliases = DEFAULT_BOOK_ALIASES if aliases is None else aliases
 
     strong: list[tuple[int, dict, str]] = []
     for book in books:
@@ -170,34 +296,34 @@ def match_book(text: str, books: list[dict]) -> tuple[dict, str] | None:
         matched_ids = {item[1].get("id") for item in strong}
         if len(matched_ids) == 1:
             strong.sort(key=lambda item: -item[0])
-            return strong[0][1], strong[0][2]
+            _, book, name = strong[0]
+            return BookMatch(book, name, "high", f"书名/目录名「{name}」完整出现")
         return None  # 题干里出现多本教材，交给全局检索
 
-    weak: dict[object, tuple[dict, str]] = {}
+    alias_hits: dict[object, BookMatch] = {}
     for book in books:
-        core = _core_title(str(book.get("title") or "")) or str(book.get("title") or "")
-        if len(core) < 3:
-            continue
-        best_fragment = ""
-        for length in (4, 3, 2):
-            for index in range(0, len(text) - length + 1):
-                fragment = text[index:index + length]
-                if not re.fullmatch(r"[\u4e00-\u9fff]+", fragment):
-                    continue
-                if fragment in BOOK_MENTION_STOPWORDS:
-                    continue
-                if fragment[0] != core[0] or not _is_subsequence(fragment, core):
-                    continue
-                if len(fragment) > len(best_fragment):
-                    best_fragment = fragment
-            if best_fragment:
-                break
-        if best_fragment:
-            weak[book.get("id")] = (book, best_fragment)
-    if len(weak) == 1:
-        book, fragment = next(iter(weak.values()))
-        return book, fragment
+        best = ""
+        for alias in _aliases_for(book, aliases):
+            index = text.find(alias)
+            if index == -1 or not _alias_is_standalone(text, index, len(alias)):
+                continue
+            if len(alias) > len(best):
+                best = alias
+        if best:
+            alias_hits[book.get("id")] = BookMatch(
+                book, best, "medium", f"显式缩写「{best}」"
+            )
+    if len(alias_hits) == 1:
+        return next(iter(alias_hits.values()))
     return None
+
+
+def match_book(text: str, books: list[dict]) -> tuple[dict, str] | None:
+    """兼容旧接口：只返回 (book, 命中片段)。新代码请用 :func:`match_book_ex`。"""
+    match = match_book_ex(text, books)
+    if match is None:
+        return None
+    return match.book, match.mention
 
 
 def strip_book_mention(question: str, mention: str) -> str:

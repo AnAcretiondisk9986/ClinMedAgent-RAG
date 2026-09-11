@@ -13,7 +13,14 @@ from typing import Any, Iterable
 import fitz
 
 from .outputs import is_internal_output
-from .qa import match_book, plan_question, strip_book_mention
+from .qa import (
+    CONFIDENCE_ORDER,
+    SCOPE_MIN_CONFIDENCE,
+    load_book_aliases,
+    match_book_ex,
+    plan_question,
+    strip_book_mention,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
@@ -81,6 +88,8 @@ class Library:
     def __init__(self, db: Path | str | None = None):
         self.db = Path(db or os.environ.get("MEDICAL_RAG_DB") or DEFAULT_DB).expanduser().resolve()
         self.db.parent.mkdir(parents=True, exist_ok=True)
+        # 教材缩写白名单（内置 + 可选的 aliases.json）
+        self.aliases = load_book_aliases(self.db.parent)
         self.cx = sqlite3.connect(self.db, timeout=30.0)
         self.cx.row_factory = sqlite3.Row
         # WAL：重建索引的大写事务进行期间读者不被阻塞；busy_timeout：并发写自动串行化
@@ -580,9 +589,11 @@ class Library:
         text = str(book).strip()
         if not text:
             return None
-        matched = match_book(text, rows)
-        if matched:
-            return {matched[0]["id"]}
+        matched = match_book_ex(text, rows, self.aliases)
+        if matched is not None and (
+            CONFIDENCE_ORDER.get(matched.confidence, 0) >= CONFIDENCE_ORDER[SCOPE_MIN_CONFIDENCE]
+        ):
+            return {matched.book["id"]}
         return {row["id"] for row in rows if text in row["title"]} or set()
 
     def search(self, query: str, limit: int = 5, book: int | str | None = None) -> list[dict]:
@@ -651,17 +662,25 @@ class Library:
         if book_ids is not None and not book_ids:
             return {"status": "invalid_book", "message": f"未找到教材：{book}"}
         scope = None
-        mention = match_book(question, books)
-        if mention is not None and (book_ids is None or mention[0]["id"] in book_ids):
-            matched_book, matched_text = mention
-            scoped_question = strip_book_mention(question, matched_text)
+        mention = match_book_ex(question, books, self.aliases)
+        if (
+            mention is not None
+            and CONFIDENCE_ORDER.get(mention.confidence, 0)
+            >= CONFIDENCE_ORDER[SCOPE_MIN_CONFIDENCE]
+            and (book_ids is None or mention.book["id"] in book_ids)
+        ):
+            scoped_question = strip_book_mention(question, mention.mention)
             if book_ids is None:
-                book_ids = {matched_book["id"]}
+                book_ids = {mention.book["id"]}
             scope = {
                 "source": "explicit" if book is not None else "question",
-                "book_id": matched_book["id"],
-                "title": matched_book["title"],
-                "mention": matched_text,
+                "book_id": mention.book["id"],
+                "title": mention.book["title"],
+                "mention": mention.mention,
+                # 置信度与命中原因：低置信度不会走到这里（SCOPE_MIN_CONFIDENCE），
+                # 调用方可据此判断自动限域是否可靠。
+                "confidence": mention.confidence,
+                "reason": mention.reason,
             }
         elif book_ids is not None:
             row = next((item for item in books if item["id"] in book_ids), None)
