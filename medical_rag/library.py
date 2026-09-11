@@ -63,6 +63,81 @@ def _correct_terms(value: str) -> str:
     return value
 
 
+# ---------------------------------------------------------------- 排序信号
+# 与 pdftext.RE_TOC_DOTS / tools_structure_v3.RE_TOC_DOTS 保持一致：
+# 中文目录引导符是……（两个 U+2026），不是三个点
+TOC_DOTS = re.compile(r"[…]{2,}|[.．·]{3,}")
+FIGURE_MARK = "[图注/图例]"
+SENTENCE_PUNCT = re.compile(r"[。；：！？]")
+
+
+def _quality_penalty(text: str) -> tuple[float, list[str]]:
+    """对目录页 / 页眉 / 图注等低价值块降权。
+
+    这些块同样堆满医学名词，字面重合度很高，但不是教材正文结论；不降权会把
+    真正的定义与正文挤下去。返回 (系数, 原因列表)。
+    """
+    penalty = 1.0
+    reasons: list[str] = []
+    if TOC_DOTS.search(text):
+        penalty *= 0.55
+        reasons.append("疑似目录页（点线引导）")
+    if text.lstrip().startswith(FIGURE_MARK):
+        penalty *= 0.75
+        reasons.append("图注/图例")
+    if len(text) < 30 and not SENTENCE_PUNCT.search(text):
+        penalty *= 0.7
+        reasons.append("文本过短（疑似页眉或标签）")
+    return penalty, reasons
+
+
+def _proximity(text: str, matched: list[str]) -> float:
+    """命中概念在文本中的集中程度（0–1）。
+
+    概念散在全页各处通常只是关键词堆砌；集中在一小段里才更可能是定义/结论。
+    """
+    if len(matched) < 2:
+        return 0.0
+    spans = [(index, index + len(term)) for term in matched if (index := text.find(term)) >= 0]
+    if len(spans) < 2:
+        return 0.0
+    window = max(end for _, end in spans) - min(start for start, _ in spans)
+    if window <= 60:
+        return 1.0
+    if window <= 160:
+        return 0.6
+    if window <= 400:
+        return 0.3
+    return 0.0
+
+
+def _match_reasons(
+    exact: bool,
+    phrase_hits: list[str],
+    proximity: float,
+    section_hits: int,
+    heading_hit: bool,
+    matched: list[str],
+    penalties: list[str],
+) -> list[str]:
+    """生成给 Agent 看的命中原因（为什么这条证据被选中）。"""
+    reasons: list[str] = []
+    if exact:
+        reasons.append("完整题干原样出现")
+    if phrase_hits:
+        reasons.append("相邻概念命中：" + "、".join(phrase_hits[:2]))
+    if proximity >= 0.6:
+        reasons.append("概念集中出现")
+    if section_hits:
+        reasons.append("章节标题匹配")
+    if heading_hit:
+        reasons.append("段落开头命中")
+    if matched:
+        reasons.append("命中概念：" + "、".join(matched[:4]))
+    reasons.extend(penalties)
+    return reasons
+
+
 
 @dataclass
 class IngestReport:
@@ -637,28 +712,53 @@ class Library:
         # metadata boosts prevent generic words such as “位置/特点” from
         # dominating the ranking.
         qgrams = {q[i:i + 2] for i in range(max(0, len(q) - 1))} or {q}
+        # 相邻概念连写（如“肩关节组成”），在定义式行文里会真正出现
+        phrases = [f"{left}{right}" for left, right in zip(tokens, tokens[1:])]
         for row in rows:
             # norm_text 来自二元组索引的缓存；回退全表扫描时为 NULL，现场规范化
             cached = row["norm_text"]
-            text = cached if cached is not None else _normalise(row["text"])
+            raw_text = row["text"]
+            text = cached if cached is not None else _normalise(raw_text)
             section = _normalise(row["section"])
             book = _normalise(row["book"])
             grams = {text[i:i + 2] for i in range(max(0, len(text) - 1))}
             overlap = len(qgrams & grams) / max(len(qgrams), 1)
             matched = [term for term in tokens if term in text]
-            coverage = len(matched) / max(len(tokens), 1)
-            hits = sum(text.count(term) for term in matched)
-            exact = 4.0 if q in text else 0.0
-            concept_boost = sum(min(text.count(term), 3) * 0.55 for term in matched)
-            section_boost = sum(0.7 for term in tokens if term in section)
-            book_boost = sum(0.25 for term in tokens if term in book)
-            score = overlap * 1.4 + coverage * 4.0 + hits * 0.08 + exact + concept_boost + section_boost + book_boost
             # Require at least one meaningful concept match. This avoids
             # returning a page only because a generic question phrase overlaps.
-            if matched and score > 0:
-                item = dict(row)
-                item["score"] = round(score, 4)
-                scored.append((score, item))
+            if not matched:
+                continue
+            coverage = len(matched) / max(len(tokens), 1)
+            hits = sum(text.count(term) for term in matched)
+            exact = q in text
+            phrase_hits = [phrase for phrase in phrases if phrase in text]
+            proximity = _proximity(text, matched)
+            section_hits = sum(1 for term in tokens if term in section)
+            book_boost = sum(0.25 for term in tokens if term in book)
+            concept_boost = sum(min(text.count(term), 3) * 0.55 for term in matched)
+            heading_hit = any(term in text[:40] for term in matched)
+            penalty, penalties = _quality_penalty(raw_text)
+            score = (
+                overlap * 1.4
+                + coverage * 4.0
+                + hits * 0.08
+                + (4.0 if exact else 0.0)
+                + concept_boost
+                + section_hits * 0.7
+                + book_boost
+                + len(phrase_hits) * 1.6
+                + proximity * 1.2
+                + (0.8 if heading_hit else 0.0)
+            ) * penalty
+            if score <= 0:
+                continue
+            item = dict(row)
+            item.pop("norm_text", None)  # 内部缓存字段，不对外暴露
+            item["score"] = round(score, 4)
+            item["match_reason"] = _match_reasons(
+                exact, phrase_hits, proximity, section_hits, heading_hit, matched, penalties
+            )
+            scored.append((score, item))
         scored.sort(key=lambda x: (-x[0], x[1]["page"], x[1]["chunk_id"]))
         return [item for _, item in scored[:limit]]
 
@@ -800,10 +900,12 @@ class Library:
                 if old is None or score > old["retrieval_score"]:
                     merged[item["chunk_id"]] = item
 
-        evidence = sorted(
+        ranked = sorted(
             merged.values(),
             key=lambda item: (-item["retrieval_score"], item["page"], item["chunk_id"]),
-        )[:limit]
+        )
+        evidence = self._dedupe_evidence(ranked, limit)
+        self._annotate_adjacent_pages(evidence)
         for item in evidence:
             item["context"] = self.get_context(item["chunk_id"], radius=1, limit=5)
 
@@ -830,6 +932,59 @@ class Library:
         if scope:
             result["book_scope"] = scope
         return result
+
+    @staticmethod
+    def _dedupe_evidence(items: list[dict], limit: int, max_per_page: int = 2) -> list[dict]:
+        """去掉重复或被包含的证据，并限制同一页最多几条。
+
+        同一段正文可能因切块边界重叠、相邻页重叠而被多次召回。重复证据只是
+        占掉上下文预算，还会让 Agent 误以为存在多处独立依据。
+
+        相邻页不做“合并成一条”：证据必须保留具体页码才能被引用校验，而且
+        ``get_context(radius=1)`` 已经会带回前后页内容；合并反而会弱化页码定位。
+        这里改为在 :meth:`_annotate_adjacent_pages` 里标注相邻页。
+        """
+        result: list[dict] = []
+        chosen: list[str] = []
+        per_page: dict[tuple, int] = {}
+        for item in items:
+            normalized = _normalise(item.get("text") or "")
+            if not normalized:
+                continue
+            if any(
+                normalized == other or normalized in other or other in normalized
+                for other in chosen
+            ):
+                continue
+            key = (item.get("book"), item.get("page"))
+            if per_page.get(key, 0) >= max_per_page:
+                continue
+            per_page[key] = per_page.get(key, 0) + 1
+            chosen.append(normalized)
+            result.append(item)
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _annotate_adjacent_pages(evidence: list[dict]) -> None:
+        """标注“同一本书里相邻页也入选”，让 Agent 知道证据在后续页延续。"""
+        pages_by_book: dict[Any, set[int]] = {}
+        for item in evidence:
+            pages_by_book.setdefault(item.get("book"), set()).add(item.get("page"))
+        for item in evidence:
+            neighbours = sorted(
+                page
+                for page in pages_by_book.get(item.get("book"), set())
+                if isinstance(page, int)
+                and isinstance(item.get("page"), int)
+                and abs(page - item["page"]) == 1
+            )
+            if neighbours:
+                item["adjacent_pages"] = neighbours
+                item["match_reason"] = list(item.get("match_reason") or []) + [
+                    "相邻页也有证据（第 " + "、".join(str(page) for page in neighbours) + " 页）"
+                ]
 
     def get_chunk(self, chunk_id: str) -> dict | None:
         row = self.cx.execute(
