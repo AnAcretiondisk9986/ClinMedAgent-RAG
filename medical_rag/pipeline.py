@@ -557,12 +557,14 @@ def import_pdf(
     root: Path | str,
     source: Path | str,
     title: str | None = None,
-    copy: bool = True,
 ) -> tuple[Path, Path]:
-    """导入一本教材：把 PDF 放到 res/<书名>/PDF/ 下。
+    """导入一本教材：把 PDF 复制到 ``res/<书名>/PDF/`` 下。
 
     返回 (book_dir, pdf_path)。同名 PDF 允许覆盖；目录里已有其他 PDF 时拒绝，
     避免同一本教材出现两个主文件。
+
+    导入前用 :func:`validate_pdf` 校验源文件，复制完成后再次校验副本；任一失败
+    都会抛错（任务标记为 error）并清理 .part 与刚建的空目录。
     """
     root = Path(root).resolve()
     source = Path(source).expanduser().resolve()
@@ -594,12 +596,6 @@ def import_pdf(
         _log_pdf_kind(task, root, target)
         task.set_progress(1, 1, "无需复制")
         return book_dir, target
-
-    if not copy:
-        task.log(f"记录引用（未复制）：{source} → 目录 {book_dir}")
-        _log_pdf_kind(task, root, source)
-        task.set_progress(1, 1, "仅记录引用")
-        return book_dir, source
 
     pdf_dir.mkdir(parents=True, exist_ok=True)
     size = source_info["size"]

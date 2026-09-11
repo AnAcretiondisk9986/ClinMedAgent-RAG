@@ -223,12 +223,6 @@ class ImportPdfTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             pipeline.import_pdf(task, self.tmp, other, title="生理学 第9版")
 
-    def test_reference_import_does_not_copy(self) -> None:
-        task = TaskManager().create_manual("import", "导入")
-        book_dir, target = pipeline.import_pdf(task, self.tmp, self.source, title="引用教材", copy=False)
-        self.assertEqual(target, self.source.resolve())
-        self.assertFalse((book_dir / "PDF" / "我的教材.pdf").exists())
-
     def test_validate_pdf_accepts_real_pdf(self) -> None:
         info = pipeline.validate_pdf(self.source)
         self.assertEqual(info["pages"], 2)

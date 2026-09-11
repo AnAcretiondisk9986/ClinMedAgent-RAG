@@ -424,7 +424,6 @@ class Handler(BaseHTTPRequestHandler):
         if not source:
             return self._send_error_json(400, "请填写 PDF 路径")
         title = str(body.get("title") or "").strip() or None
-        copy = bool(body.get("copy", True))
         path = Path(source).expanduser()
         if not path.exists():
             return self._send_error_json(400, f"文件不存在：{path}")
@@ -433,8 +432,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.suffix.lower() != ".pdf":
             return self._send_error_json(400, "目前只支持 PDF 文件")
         resolved = path.resolve()
-        book_title = title or resolved.stem
-        if not copy and self._pdf_conflict(book_title, resolved.name):
+        if self._pdf_conflict(title or resolved.stem, resolved.name):
             return self._send_error_json(400, "目标目录已存在其他 PDF，请换一个书名")
 
         from .pipeline import import_pdf  # 延迟导入，避免循环引用
@@ -443,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
         task = app.tasks.create(
             "import",
             f"导入《{title or resolved.stem}》",
-            lambda current: import_pdf(current, app.root, resolved, title=title, copy=copy),
+            lambda current: import_pdf(current, app.root, resolved, title=title),
             meta={"kind": "path", "path": str(resolved)},
         )
         self._send_data({"task_id": task.id})

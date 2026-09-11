@@ -245,6 +245,33 @@ class ImportTests(WebAppTestCase):
         status, payload = self.json_data("/api/import", "POST", {"path": str(self.tmp / "nope.pdf")})
         self.assertEqual(status, 400)
 
+    def test_path_import_rejects_conflicting_pdf(self) -> None:
+        """目标目录已有其他 PDF 时，路径导入同步返回 400，不创建任务。"""
+        existing = self.tmp / "res" / "冲突书" / "PDF"
+        existing.mkdir(parents=True)
+        make_pdf(existing / "已有.pdf", pages=1)
+        source = self.tmp / "另一本.pdf"
+        make_pdf(source, pages=1)
+        status, payload = self.json_data(
+            "/api/import", "POST", {"path": str(source), "title": "冲突书"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("已存在", payload["error"])
+
+    def test_path_import_ignores_legacy_copy_flag(self) -> None:
+        """copy 参数已移除；旧客户端仍传 copy=false 时应按普通导入处理（始终复制）。"""
+        source = self.tmp / "旧客户端.pdf"
+        make_pdf(source, pages=1)
+        status, payload = self.json_data(
+            "/api/import", "POST", {"path": str(source), "title": "旧客户端教材", "copy": False}
+        )
+        self.assertEqual(status, 200)
+        task = self.wait_task(payload["data"]["task_id"])
+        self.assertEqual(task["status"], "done")
+        self.assertTrue(
+            (self.tmp / "res" / "旧客户端教材" / "PDF" / "旧客户端.pdf").exists()
+        )
+
     def test_streamed_upload(self) -> None:
         status, payload = self.json_data(
             "/api/import/begin", "POST", {"filename": "上传教材.pdf", "title": "上传教材"}

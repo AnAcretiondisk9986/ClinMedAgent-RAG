@@ -860,8 +860,7 @@ async function submitImport() {
       const path = $("#path-input").value.trim();
       if (!path) throw new Error("请填写 PDF 路径");
       const title = $("#path-title").value.trim();
-      const copy = $("#path-copy").checked;
-      await api("/api/import", { method: "POST", body: JSON.stringify({ path, title, copy }) });
+      await api("/api/import", { method: "POST", body: JSON.stringify({ path, title }) });
       toast("已开始导入", "ok");
     }
     $("#import-modal").hidden = true;
