@@ -5,6 +5,12 @@
     $("#btn-sidebar")?.addEventListener("click", e => { document.body.classList.toggle("sidebar-collapsed"); e.currentTarget.setAttribute("aria-expanded", String(!document.body.classList.contains("sidebar-collapsed"))); });
     $("#btn-overview")?.addEventListener("click", () => $("#brand-home")?.click());
     $("#btn-tasks")?.addEventListener("click", () => typeof openTaskPanel === "function" && openTaskPanel());
+    const themeButton = $("#btn-theme");
+    const savedTheme = localStorage.getItem("clinmedagent-theme");
+    if (savedTheme === "light" || savedTheme === "dark") document.documentElement.dataset.theme = savedTheme;
+    const updateThemeButton = () => { const dark = document.documentElement.dataset.theme === "dark" || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches); if(themeButton){ themeButton.textContent = dark ? "☀ 亮色" : "☾ 暗色"; themeButton.setAttribute("aria-pressed", String(dark)); } };
+    updateThemeButton();
+    themeButton?.addEventListener("click", () => { const dark = document.documentElement.dataset.theme !== "dark"; document.documentElement.dataset.theme = dark ? "dark" : "light"; localStorage.setItem("clinmedagent-theme", document.documentElement.dataset.theme); updateThemeButton(); });
     $("#btn-focus")?.addEventListener("click", e => { const on=document.body.classList.toggle("reading-focus"); e.currentTarget.textContent=on?"退出专注":"专注阅读"; e.currentTarget.setAttribute("aria-pressed",String(on)); });
     ["book-filter","book-status-filter"].forEach(id => $("#"+id)?.addEventListener(id==="book-filter"?"input":"change", () => typeof renderBookList === "function" && renderBookList()));
     document.addEventListener("keydown", e => { if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="k"){e.preventDefault();$("#global-search-input")?.focus();} });

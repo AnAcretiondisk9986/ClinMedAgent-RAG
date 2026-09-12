@@ -144,6 +144,7 @@ function bookBadges(book, running) {
 
 function renderBookList() {
   const list = $("#book-list");
+  const firstRender = !list.dataset.hydrated;
   const needle = ($("#book-filter")?.value || "").trim().toLowerCase();
   const filter = $("#book-status-filter")?.value || "all";
   const visible = state.books.filter((book) => {
@@ -160,7 +161,7 @@ function renderBookList() {
   }
   for (const book of visible) {
     const card = document.createElement("div");
-    card.className = "book-card" + (state.selected && state.selected.id === book.id ? " active" : "");
+    card.className = "book-card" + (state.selected && state.selected.id === book.id ? " active" : "") + (firstRender ? " initial-enter" : "");
     const pages = book.status.pdf.pages || book.quality.pages || 0;
     const chunks = book.status.index.chunks || 0;
     card.innerHTML = `
@@ -184,6 +185,7 @@ function renderBookList() {
     card.addEventListener("click", () => selectBook(book));
     list.appendChild(card);
   }
+  list.dataset.hydrated = "true";
   const dashboard = $("#dashboard-books");
   if (dashboard) {
     const recent = state.books.slice(0, 4);
@@ -269,6 +271,8 @@ function renderDetail(book) {
   $("#input-printed").disabled = !state.offset;
   $("#printed-total").textContent = state.totalPrintedPages ? `/ ${state.totalPrintedPages}` : "/ —";
   $("#pdf-total").textContent = state.totalPdfPages ? `/ ${state.totalPdfPages}` : "/ —";
+  const slider = $("#page-slider");
+  if (slider) { slider.max = String(state.totalPdfPages || 1); slider.value = String(state.page || 1); slider.disabled = !book.pdf; }
 }
 
 function showDetailView() {
@@ -511,6 +515,7 @@ function loadPage() {
   $("#input-pdf").value = String(state.page);
   const printed = state.page - state.offset;
   $("#input-printed").value = state.offset && printed >= 1 ? String(printed) : "";
+  const slider = $("#page-slider"); if (slider) slider.value = String(state.page);
   applyZoom({ silent: true });
   loadPageText(printed);
 }
@@ -1029,6 +1034,7 @@ function bindEvents() {
     if (event.key === "Enter") jumpToPrinted(Number(event.target.value));
   });
   $("#input-pdf").addEventListener("change", (event) => jumpToPdf(Number(event.target.value)));
+  $("#page-slider").addEventListener("input", (event) => setPage(Number(event.target.value)));
   $("#input-pdf").addEventListener("keydown", (event) => {
     if (event.key === "Enter") jumpToPdf(Number(event.target.value));
   });

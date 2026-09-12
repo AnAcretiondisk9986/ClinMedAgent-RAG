@@ -50,7 +50,7 @@ medical-rag-web = "medical_rag.webapp:main"
 packages = ["medical_rag"]
 
 [tool.setuptools.package-data]
-medical_rag = ["webui/*"]
+medical_rag = ["webui/*", "webui/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

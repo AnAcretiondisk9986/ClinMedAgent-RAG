@@ -10,9 +10,9 @@
 <a class="skip-link" href="#main-content">跳到工作区</a>
 <header class="topbar">
   <button class="brand" id="brand-home" title="返回书库概览" aria-label="返回书库概览">
-    <span class="logo" aria-hidden="true">M<span>＋</span></span>
+    <span class="logo" aria-hidden="true"><img src="/static/assets/clinmedagent-mark.png" alt=""></span>
     <div class="brand-text">
-      <span class="brand-title">MedShelf <span>医学教材工作台</span></span>
+      <span class="brand-title">ClinMedAgent <span>医学教材工作台</span></span>
       <div class="sub" id="root-path">正在连接…</div>
     </div>
   </button>
@@ -44,7 +44,7 @@
   </aside>
 
   <main class="main" id="main-content" tabindex="-1">
-    <div class="workspace-bar"><div><button id="btn-sidebar" class="btn ghost small" aria-label="收起教材侧栏" aria-controls="library-sidebar" aria-expanded="true">☰</button><span class="workspace-breadcrumb" id="workspace-breadcrumb">工作台 / 概览</span></div><div class="workspace-bar-actions"><button id="btn-return-search" class="btn ghost small" hidden>返回检索</button><span class="workspace-note">引用优先 · 本地检索</span><button id="btn-focus" class="btn ghost small" aria-pressed="false">专注阅读</button></div></div>
+    <div class="workspace-bar"><div><button id="btn-sidebar" class="btn ghost small" aria-label="收起教材侧栏" aria-controls="library-sidebar" aria-expanded="true">☰</button><span class="workspace-breadcrumb" id="workspace-breadcrumb">工作台 / 概览</span></div><div class="workspace-bar-actions"><button id="btn-return-search" class="btn ghost small" hidden>返回检索</button><span class="workspace-note">引用优先 · 本地检索</span><button id="btn-theme" class="btn ghost small" aria-label="切换亮色或暗色模式" title="切换亮色或暗色模式">☾ 暗色</button><button id="btn-focus" class="btn ghost small" aria-pressed="false">专注阅读</button></div></div>
     <section id="welcome" class="welcome">
       <div class="welcome-card">
         <div class="eyebrow">YOUR KNOWLEDGE, WITH CONTEXT</div><h2>让每一次查阅，<br><span>都有据可循。</span></h2>
@@ -56,7 +56,11 @@
           <button id="btn-welcome-guide" class="btn ghost">处理流程说明</button>
         </div>
         <section class="dashboard-library" aria-labelledby="recent-heading"><div class="section-heading"><div><div class="eyebrow">YOUR LIBRARY</div><h3 id="recent-heading">继续探索</h3></div><span id="dashboard-count" class="muted"></span></div><div id="dashboard-books" class="dashboard-books"></div></section>
-        <div class="workflow-note"><span class="workflow-icon">↳</span><div><strong>从一本教材，开始建立知识库</strong><p>导入 PDF → 自动检测文字层 → 解析与索引 → 按页引用</p></div></div>
+        <section class="capability-strip" aria-label="工作台能力">
+          <article><span class="capability-index">01</span><strong>检索</strong><p>从教材原文找到可引用证据。</p></article>
+          <article><span class="capability-index">02</span><strong>解析</strong><p>识别文字、表格与版面结构。</p></article>
+          <article><span class="capability-index">03</span><strong>核对</strong><p>回到页码，保留上下文。</p></article>
+        </section>
         <details id="guide" class="guide">
           <summary>处理流程都在做什么？</summary>
           <ol>
@@ -96,6 +100,7 @@
             <label class="page-field">PDF 页 <input id="input-pdf" class="page-input" type="number" min="1" inputmode="numeric"></label>
             <span id="pdf-total" class="muted">/ —</span>
           </div>
+          <label class="page-slider-wrap" title="拖动快速翻页"><span>快速翻页</span><input id="page-slider" class="page-slider" type="range" min="1" max="1" value="1" step="1" aria-label="快速翻页"></label>
           <button id="btn-next" class="btn small">下一页 ›</button>
           <div class="zoom-controls">
             <button id="btn-zoom-out" class="btn small" title="缩小（-）">−</button>
