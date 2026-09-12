@@ -144,14 +144,21 @@ function bookBadges(book, running) {
 
 function renderBookList() {
   const list = $("#book-list");
+  const needle = ($("#book-filter")?.value || "").trim().toLowerCase();
+  const filter = $("#book-status-filter")?.value || "all";
+  const visible = state.books.filter((book) => {
+    const name = `${book.title || ""} ${book.index_title || ""}`.toLowerCase();
+    const ready = Boolean(book.status?.index?.complete);
+    return (!needle || name.includes(needle)) && (filter === "all" || (filter === "ready" ? ready : !ready));
+  });
   $("#book-count").textContent = String(state.books.length);
   list.innerHTML = "";
-  if (!state.books.length) {
+  if (!visible.length) {
     const hint = state.root ? `<br>也可以把 PDF 放到 <code>${escapeHtml(state.root)}/res/&lt;书名&gt;/PDF/</code> 下再刷新。` : "";
     list.innerHTML = `<div class="muted" style="padding:16px">书库还是空的，点右上角“导入教材”。${hint}</div>`;
     return;
   }
-  for (const book of state.books) {
+  for (const book of visible) {
     const card = document.createElement("div");
     card.className = "book-card" + (state.selected && state.selected.id === book.id ? " active" : "");
     const pages = book.status.pdf.pages || book.quality.pages || 0;
@@ -176,6 +183,13 @@ function renderBookList() {
     }
     card.addEventListener("click", () => selectBook(book));
     list.appendChild(card);
+  }
+  const dashboard = $("#dashboard-books");
+  if (dashboard) {
+    const recent = state.books.slice(0, 4);
+    $("#dashboard-count") && ($("#dashboard-count").textContent = `${state.books.length} 本教材`);
+    dashboard.innerHTML = recent.map((book) => `<button class="dashboard-book" data-dashboard-book="${escapeHtml(book.id)}"><span class="dashboard-cover-wrap"></span><span class="dashboard-book-copy"><h4>${escapeHtml(book.title)}</h4><p>${book.status?.pdf?.pages ? `${book.status.pdf.pages} 页` : "页数未知"} · ${book.status?.index?.complete ? "可检索" : "待处理"}</p><span class="resume">${book.status?.index?.complete ? "继续阅读 →" : "开始处理 →"}</span></span></button>`).join("");
+    recent.forEach((book) => { const card=dashboard.querySelector(`[data-dashboard-book="${CSS.escape(String(book.id))}"]`); if(!card)return; const img=document.createElement("img"); img.className="dashboard-cover"; img.alt=""; img.loading="lazy"; img.src=`/api/books/${book.id}/cover.png?w=180&v=${book.status?.pdf?.mtime || ""}`; img.onerror=()=>img.replaceWith(coverPlaceholder(book.title)); card.querySelector(".dashboard-cover-wrap").replaceWith(img); card.addEventListener("click",()=>selectBook(book)); });
   }
 }
 
