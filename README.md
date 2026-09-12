@@ -47,7 +47,7 @@ ClinMedAgent-RAG/
 │   └── webui/                原生前端（无框架，随包分发）
 ├── tools/                    OCR / 版面 / 表格 / 纠错 / 结构化脚本（独立子进程入口）
 ├── tests/                    测试套件（pytest）
-├── scripts/                  启动脚本（start_web.bat 等）
+├── scripts/                  启动与运维脚本（start_web.bat 等）
 ├── .pi/                      pi Agent 集成：extensions/ + skills/
 ├── res/                      本地教材数据（PDF、text_v3、processed_v3）—— gitignored
 ├── .medical_rag/             索引库与 PDF 分析缓存 —— gitignored
@@ -56,6 +56,7 @@ ClinMedAgent-RAG/
 ├── requirements-core.txt     核心依赖
 ├── requirements-ocr.txt      OCR 流水线依赖（含 CUDA 组合说明）
 ├── requirements-paddle.txt   版面/表格流水线依赖
+├── start_web.bat            根目录双击即启动网站（转调 scripts/start_web.bat）
 └── LICENSE  README.md  pyproject.toml
 ```
 
@@ -156,7 +157,9 @@ python -m medical_rag.webapp            # 默认 http://127.0.0.1:17173（冷门
 python -m medical_rag.webapp --port 18080 --no-browser
 ```
 
-Windows 下也可以直接双击 `scripts\start_web.bat`：脚本会自动定位可用 Python（PATH 里的 `python` → `py -3` → 项目自带 `.venv-ocr`）并检查 PyMuPDF，缺依赖时给出中文提示；参数会原样透传，例如 `scripts\start_web.bat --port 18080`。
+Windows 下也可以直接双击根目录的 `start_web.bat`（或 `scripts\start_web.bat`，前者只是转调后者）：脚本会自动定位可用 Python（PATH 里的 `python` → `py -3` → 项目自带 `.venv` / `.venv-ocr` / `.venv-ocr312`）并检查 PyMuPDF，缺依赖时给出中文提示；参数会原样透传，例如 `start_web.bat --port 18080`。
+
+> 批处理内容为 GBK 编码 + CRLF 换行（配合 `chcp 936`），编辑时请保留该编码，否则中文提示会变成乱码。
 
 页面功能：
 

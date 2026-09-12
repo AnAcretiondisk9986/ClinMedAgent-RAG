@@ -1,14 +1,20 @@
 @echo off
-title Ò½Ñ§ï¿½Ì²Ä¹ï¿½ï¿½ï¿½Ì¨
+title Ò½Ñ§½Ì²Ä¹¤×÷Ì¨
 chcp 936 >nul 2>nul
 cd /d "%~dp0.."
 setlocal
 
-rem ï¿½ï¿½ï¿½Î³ï¿½ï¿½ï¿½ PATH ï¿½ï¿½ï¿½ python / py -3 / ï¿½ï¿½Ä¿ï¿½Ô´ï¿½ .venv-ocrï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ import fitz
+rem °´Ë³ÐòÌ½²â¿ÉÓÃ½âÊÍÆ÷£ºPATH ÀïµÄ python / py -3£¬ÔÙµ½ÏîÄ¿×Ô´øµÄÐéÄâ»·¾³¡£
+rem Æô¶¯ÍøÒ³ÐèÒªÄÜ import fitz£¨PyMuPDF£©£¬Ì½²â²»µ½¾Í¸ø³öÖÐÎÄÌáÊ¾¡£
 set "PYTHON="
 where python >nul 2>nul && python -c "import fitz" >nul 2>nul && set "PYTHON=python"
 if not defined PYTHON (
     where py >nul 2>nul && py -3 -c "import fitz" >nul 2>nul && set "PYTHON=py -3"
+)
+if not defined PYTHON (
+    if exist ".venv\Scripts\python.exe" (
+        ".venv\Scripts\python.exe" -c "import fitz" >nul 2>nul && set "PYTHON=.venv\Scripts\python.exe"
+    )
 )
 if not defined PYTHON (
     if exist ".venv-ocr\Scripts\python.exe" (
@@ -16,25 +22,31 @@ if not defined PYTHON (
     )
 )
 if not defined PYTHON (
+    if exist ".venv-ocr312\Scripts\python.exe" (
+        ".venv-ocr312\Scripts\python.exe" -c "import fitz" >nul 2>nul && set "PYTHON=.venv-ocr312\Scripts\python.exe"
+    )
+)
+if not defined PYTHON (
     echo.
-    echo [ï¿½ï¿½ï¿½ï¿½] Ã»ï¿½ï¿½ï¿½Òµï¿½ï¿½ï¿½ï¿½Ãµï¿½ Python ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òª Python 3.10+ ï¿½ï¿½ï¿½Ñ°ï¿½×° PyMuPDFï¿½ï¿½ï¿½ï¿½
-    echo        ï¿½ï¿½×°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½python -m pip install PyMuPDF
+    echo [´íÎó] Ã»ÓÐÕÒµ½¿ÉÓÃµÄ Python ½âÊÍÆ÷£¨ÐèÒª Python 3.10+£¬ÇÒÒÑ°²×° PyMuPDF£©¡£
+    echo        °²×°ÃüÁî£ºpython -m pip install PyMuPDF
+    echo        Ò²¿ÉÒÔÏÈ¼¤»îÏîÄ¿×Ô´øµÄÐéÄâ»·¾³£¬ÔÙÔËÐÐ±¾½Å±¾¡£
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo  ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò½Ñ§ï¿½Ì²Ä¹ï¿½ï¿½ï¿½Ì¨...
-echo  Ä¬ï¿½Ïµï¿½Ö·ï¿½ï¿½http://127.0.0.1:17173/   ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¶ï¿½ï¿½ï¿½
-echo  ï¿½Ø±Õ±ï¿½ï¿½ï¿½ï¿½Ú¼ï¿½Í£Ö¹ï¿½ï¿½ï¿½ñ£»¸Ä¶Ë¿Ú¿ï¿½ï¿½ï¿½ï¿½Ð£ï¿½start_web.bat --port 18080
+echo  ÕýÔÚÆô¶¯±¾µØÒ½Ñ§½Ì²Ä¹¤×÷Ì¨...
+echo  Ä¬ÈÏµØÖ·£ºhttp://127.0.0.1:17173/   £¨Æô¶¯ºó»á×Ô¶¯´ò¿ªä¯ÀÀÆ÷£©
+echo  ¹Ø±Õ±¾´°¿Ú¼´Í£Ö¹·þÎñ£»¸Ä¶Ë¿Ú¿ÉÒÔ´«²Î£ºstart_web.bat --port 18080
 echo.
 
 %PYTHON% -X utf8 -m medical_rag.webapp %*
 
 if errorlevel 1 (
     echo.
-    echo [ï¿½ï¿½ï¿½ï¿½] ï¿½ï¿½Õ¾ï¿½ï¿½ï¿½ï¿½Ê§ï¿½Ü£ï¿½ï¿½ï¿½é¿´ï¿½Ï·ï¿½ï¿½ï¿½Ê¾ï¿½ï¿½
+    echo [´íÎó] ÍøÕ¾Æô¶¯Ê§°Ü£¬Çë²é¿´ÉÏ·½ÌáÊ¾ÐÅÏ¢¡£
     pause
     exit /b 1
 )
