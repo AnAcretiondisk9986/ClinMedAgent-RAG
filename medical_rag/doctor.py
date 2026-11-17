@@ -152,54 +152,159 @@ def _probe_import(python: str, modules: tuple[str, ...]) -> tuple[bool, str]:
     return False, last[8:] if last.startswith("MISSING:") else last
 
 
+def _stale_reason(item: dict[str, Any], base: Path) -> str:
+    """索引是否落后于源 PDF：与 ``Library.book_freshness`` 同一套 mtime+size 判据。"""
+    from .paths import absolute_path
+
+    if item.get("content_hash") is None:
+        return "索引没有来源指纹（旧版本建立），建议重建索引"
+    source = absolute_path(base, item.get("source_path"))
+    if source is None or not source.exists():
+        return f"源 PDF 不存在：{item.get('source_path')}"
+    try:
+        stat = source.stat()
+    except OSError as exc:
+        return f"源 PDF 不可读：{exc}"
+    mtime_changed = item.get("source_mtime") is None or abs(
+        float(item["source_mtime"]) - stat.st_mtime
+    ) > 1e-6
+    size_changed = item.get("source_size") is None or int(item["source_size"]) != stat.st_size
+    if mtime_changed or size_changed:
+        return "源 PDF 已变化（mtime/大小不同），索引可能过期"
+    return ""
+
+
 def _database_report(
     db_path: Path, root: Path | str | None = None
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """只用一条**只读**连接读出索引库报告。
+
+    ``Library()`` 的构造器会执行 DDL 与 ``PRAGMA user_version``，只读介质/受限
+    ACL 下直接失败，会把健康库判成 error（CLI 退出码 1、``/api/health`` 503）。
+    这里改成只读 URI 连接（``immutable=1`` 回退），深检做不了只降级成 warn。
+    """
     if not db_path.exists():
         return (
             {"path": str(db_path), "exists": False},
             [_check("索引库", "warn", f"尚未建立：{db_path}", "先导入并处理一本教材")],
         )
-    from .library import Library
+    import sqlite3
+
+    from .library import _normalise
+    from .workspace import open_readonly
 
     base = Path(root).expanduser().resolve() if root else db_path.parent.parent
     try:
-        library = Library(db_path, root=base)
-    except Exception as exc:  # noqa: BLE001 - 打不开就是 error
+        connection = open_readonly(db_path)
+    except sqlite3.Error as exc:
+        # 打不开只读库是「读不了」而不是「库坏了」：warning，避免健康检查假报错
         return (
             {"path": str(db_path), "exists": True, "error": str(exc)},
-            [_check("索引库", "error", f"打不开：{exc}")],
+            [
+                _check(
+                    "索引库",
+                    "warn",
+                    f"只读打开失败（库可能被占用或权限受限）：{exc}",
+                    "确认库文件权限；只读介质上可先复制一份再自检",
+                )
+            ],
         )
     try:
-        books = library.list_books()
-        chunks = int(library.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
-        integrity = library.fts_integrity_ok()
-        stale = library.stale_books()
-        # 库里实际保存的写法（相对/绝对）：用于提示“这份索引能不能跟着目录搬走”
-        raw_paths = [row["path"] for row in library.cx.execute("SELECT path FROM books")]
-        relative_paths = sum(1 for value in raw_paths if value and not Path(value).is_absolute())
-        missing_books = [
-            book["title"]
-            for book in books
-            if book.get("path") and not Path(book["path"]).exists()
-        ]
-        report = {
-            "path": str(db_path),
-            "exists": True,
-            "books": len(books),
-            "chunks": chunks,
-            "fts_integrity": integrity,
-            "relative_paths": relative_paths,
-            "missing_books": missing_books,
-            "embedding_backend": getattr(library, "embedding", None) and library.embedding.name,
-            "embedding_warning": getattr(library, "embedding_warning", ""),
-            "stale_books": [
-                {"title": item.get("title"), "reason": item.get("reason")} for item in stale
+        book_rows = [dict(row) for row in connection.execute("SELECT * FROM books ORDER BY title")]
+        chunks = int(connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+    except sqlite3.Error as exc:
+        connection.close()
+        return (
+            {"path": str(db_path), "exists": True, "error": str(exc)},
+            [
+                _check(
+                    "索引库",
+                    "warn",
+                    f"只读读取失败（库可能被占用或权限受限）：{exc}",
+                    "确认库文件权限；只读介质上可先复制一份再自检",
+                )
             ],
-            "titles": [book["title"] for book in books],
-        }
-    finally:
-        library.close()
+        )
+    # 文件级完整性：PRAGMA quick_check 只读即可执行，能抓出 b-tree/页级损坏。
+    # 深检只比对索引行数，抓不到"库被写坏但行数还对"的情况；旧实现靠
+    # chunks_fts 的 integrity-check，改成只读连接后那条路径不可用，所以补这一层。
+    try:
+        quick = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+    except sqlite3.Error as exc:
+        quick = f"quick_check 执行失败：{exc}"
+    db_healthy = quick.strip().lower() == "ok"
+    deep_error = ""
+    try:
+        # 深检：三套索引与 chunks 是否一致（只读可做，不触发任何写语句）
+        indexed = int(connection.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0])
+        drift: list[dict[str, Any]] = []
+        for row in connection.execute(
+            "SELECT c.rowid AS rowid, c.text AS text, n.norm_text AS norm FROM chunks c "
+            "JOIN chunks_fts_ngram n ON n.rowid = c.rowid"
+        ):
+            if _normalise(row["text"]) != row["norm"]:
+                drift.append({"rowid": row["rowid"]})
+                if len(drift) >= 3:
+                    break
+        drift_checked = True
+    except sqlite3.Error as exc:
+        indexed, drift, drift_checked = -1, [], False
+        if "no such table" in str(exc).lower():
+            # 老库可能没有二元组索引表：只读深检做不了，降级成 warn（不算错误）
+            deep_error = "老库缺少二元组索引表"
+        else:
+            # 读失败 ≠ 缺表：可能是库损坏，必须记 error 而不是悄悄变成 warn
+            deep_error = f"深检读失败：{exc}"
+            db_healthy = False
+    embedding_backend = ""
+    embedding_warning = ""
+    try:
+        from .embeddings import create_backend_cached
+
+        backend, embedding_warning = create_backend_cached(os.environ.get("MEDICAL_RAG_EMBEDDING"))
+        embedding_backend = backend.name
+        vectors = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE backend = ?", (embedding_backend,)
+            ).fetchone()[0]
+        )
+    except Exception:  # noqa: BLE001 - 后端不可用属正常（检索会退回词法）
+        vectors = int(connection.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0])
+    connection.close()
+
+    raw_paths = [row["path"] for row in book_rows]
+    relative_paths = sum(1 for value in raw_paths if value and not Path(value).is_absolute())
+    from .paths import absolute_path
+
+    missing_books = []
+    for row in book_rows:
+        raw = row.get("path")
+        if not raw:
+            continue
+        resolved = absolute_path(base, raw)
+        if resolved is None or not resolved.exists():
+            missing_books.append(row["title"])
+    stale = [
+        {"title": row["title"], "reason": reason}
+        for row in book_rows
+        if (reason := _stale_reason(row, base))
+    ]
+    fts_ok = db_healthy and drift_checked and indexed == chunks and not drift and vectors == chunks
+    report = {
+        "path": str(db_path),
+        "exists": True,
+        "books": len(book_rows),
+        "chunks": chunks,
+        "integrity_check": quick,
+        "fts_integrity": fts_ok,
+        "relative_paths": relative_paths,
+        "missing_books": missing_books,
+        "embedding_backend": embedding_backend,
+        "embedding_warning": embedding_warning,
+        "stale_books": [{"title": item["title"], "reason": item["reason"]} for item in stale],
+        "titles": [row["title"] for row in book_rows],
+        "readonly": True,
+    }
     if not raw_paths:
         path_status, path_detail, path_hint = "warn", "索引库还没有教材记录", "先导入并处理一本教材"
     elif missing_books:
@@ -210,32 +315,50 @@ def _database_report(
         path_status = "ok"
         path_detail = f"{relative_paths}/{len(raw_paths)} 本用相对路径保存，可随目录整体搬走"
         path_hint = ""
+    if not db_healthy:
+        integrity_check = _check(
+            "索引库完整性",
+            "error",
+            f"PRAGMA quick_check 未通过：{quick[:120]}",
+            "库文件可能损坏：先备份，再运行 medical-rag doctor --repair 或重建索引",
+        )
+    elif drift_checked:
+        integrity_check = _check(
+            "FTS 索引一致性",
+            "ok" if fts_ok else "error",
+            "一致"
+            if fts_ok
+            else "chunks 与 FTS/向量索引不一致（历史版本遗留）",
+            "" if fts_ok else "运行 medical-rag doctor --repair 或重建索引修复",
+        )
+    else:
+        integrity_check = _check(
+            "FTS 索引一致性",
+            "warn",
+            f"只读模式下无法深检：{deep_error}",
+            "需要完整校验时运行 medical-rag doctor --repair",
+        )
     checks = [
         _check(
             "索引库",
             "ok",
-            f"{len(books)} 本教材 / {chunks} 个证据块（{db_path.name}）",
+            f"{len(book_rows)} 本教材 / {chunks} 个证据块（{db_path.name}）",
         ),
-        _check(
-            "FTS 索引一致性",
-            "ok" if integrity else "error",
-            "一致" if integrity else "chunks 与 chunks_fts 不一致（历史版本遗留）",
-            "" if integrity else "运行 medical-rag doctor --repair 或重建索引修复",
-        ),
+        integrity_check,
         _check(
             "向量后端",
-            "warn" if library.embedding_warning else "ok",
-            library.embedding.name
-            + (f"（{library.embedding_warning}）" if library.embedding_warning else ""),
+            "warn" if embedding_warning else "ok",
+            (embedding_backend or "未知后端")
+            + (f"（{embedding_warning}）" if embedding_warning else ""),
             ""
-            if not library.embedding_warning
+            if not embedding_warning
             else "语义后端不可用属正常：检索会自动退回词法后端，不影响可用性",
         ),
         _check(
             "索引时效性",
             "warn" if stale else "ok",
             f"{len(stale)} 本教材的索引可能过期" if stale else "索引与源 PDF 一致",
-            "；".join(f"{item.get('title')}：{item.get('reason')}" for item in stale[:3]) if stale else "",
+            "；".join(f"{item['title']}：{item['reason']}" for item in stale[:3]) if stale else "",
         ),
         _check("索引路径", path_status, path_detail, path_hint),
     ]

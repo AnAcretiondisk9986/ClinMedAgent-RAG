@@ -7,13 +7,13 @@
 ## 特性
 
 - **本地优先**：教材、索引和处理产物默认保存在本机，不上传 PDF。
-- **引用优先**：检索结果返回教材、原书页码、PDF 页码、章节和 `chunk_id`。
+- **引用优先**：检索结果返回教材、原书页码、章节和 `chunk_id`；页码按页脚校准为原书页码，可以直接对纸质书核对。
 - **文字层直通**：自动识别文字层 PDF，跳过 OCR，直接解析并建索引。
 - **完整 OCR 流水线**：支持 OCR、版面检测、表格还原、定向纠错和结构化。
 - **中文检索优化**：SQLite FTS5 字符二元组索引，适配中文教材，避免全表扫描。
 - **候选重排**：支持标题匹配、章节集中度、内容类型降权和可选向量重排。
 - **多种接入方式**：本地 Web 工作台、命令行、MCP Server、JSON Lines Bridge。
-- **安全默认值**：默认仅监听 loopback；远程监听需要显式开启并使用访问令牌。
+- **安全默认值**：默认仅监听 loopback；远程监听需要显式开启并使用访问令牌；请求会校验 Host 与同源 Origin，变更类接口还要求 `application/json`。
 - **可整体移动**：索引里只存相对项目根目录的路径，项目目录改名、换盘、复制一份到别处后，书库与检索都不需要重做（详见[文件说明](文件说明_FILE-MAP.md)）。
 - **可诊断可维护**：提供 `doctor` 环境检查、索引修复和 SQLite 压缩命令。
 
@@ -154,6 +154,8 @@ medical-rag doctor --json
 medical-rag doctor --deep
 ```
 
+自检是只读的：用只读连接读取索引库，不建库、不写库；索引库被占用或位于只读介质上时，这一项记为警告而不是错误。
+
 修复全文索引：
 
 ```powershell
@@ -168,6 +170,28 @@ medical-rag doctor --compact
 
 `--repair` 和 `--compact` 会修改索引数据库，请确保数据库目录可写，并在重要数据上提前备份。
 索引里记录的是相对项目根目录的路径，项目目录被移动/改名后打开库会自动迁移，通常不需要手工改库。
+
+## 环境变量
+
+都可以在启动前用 PowerShell 设置（例如 `$env:MEDICAL_RAG_DB="D:\索引\library.sqlite3"`），不设置时取默认值。
+
+| 变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `MEDICAL_RAG_ROOT` | 项目根目录；索引里的相对路径按它还原 | 按索引库位置推断 |
+| `MEDICAL_RAG_DB` | 索引库路径（未显式指定 `--db` 时使用；MCP 与 Bridge 同样生效） | `<项目根>/.medical_rag/library.sqlite3` |
+| `MEDICAL_RAG_EMBEDDING` | 向量后端：`lexical` 或 `ollama:<模型>`；不可用时自动回退词法后端 | `lexical` |
+| `MEDICAL_RAG_RERANKER` | 候选重排器，目前只有 `feature` | `feature` |
+| `MEDICAL_RAG_ALIASES` | 自定义教材缩写表 JSON 的路径 | 索引库同目录下的 `aliases.json`（存在才生效） |
+| `MEDICAL_RAG_PYTHON` | 文字层解析、结构化、建立索引三个阶段使用的 Python | 当前解释器 |
+| `MEDICAL_RAG_OCR_PYTHON` | OCR 与定向纠错阶段使用的 Python | 自动探测 `.venv-ocr` |
+| `MEDICAL_RAG_PADDLE_PYTHON` | 版面/表格阶段使用的 Python | 自动探测 `.venv-ocr312` |
+| `MEDICAL_RAG_STAGE_TIMEOUT_<阶段>` | 覆盖单个流水线阶段的超时秒数，`<=0` 表示不限时；阶段名用 `TEXT`/`OCR`/`LAYOUT`/`TABLES`/`FIX`/`STRUCTURE`/`INDEX` | 见下方默认值 |
+| `MEDICAL_RAG_WEB_PORT` | Web 工作台的默认端口 | `17173` |
+| `MEDICAL_RAG_TOKEN` | Web 访问令牌 | 本机监听为空；监听非本机地址时自动生成 |
+| `MEDICAL_RAG_MAX_UPLOAD` | 单次上传的字节上限 | 2 GB |
+| `MEDICAL_RAG_WEB_CACHE_MAX_MB` | 页面预览图缓存上限（MB） | `256` |
+
+各阶段超时默认值（秒）：文字层解析 1800、OCR 按页数估算（12 秒/页，最少 600）、版面 1200、表格 1200、纠错 900、结构化 1200、建立索引 900。
 
 ## Agent 接入
 
@@ -228,7 +252,7 @@ res/                      # 教材 PDF 与流水线产物（索引指向这里�
 output/                   # 生成好的 PDF 等交付物（可选，不参与运行）
 ```
 
-上述本地数据默认不纳入 Git。请勿将包含教材 PDF 或敏感资料的目录提交到公共仓库。
+上述目录中 `.build/`、`res/`、`.medical_rag/` 已被 `.gitignore` 排除；`output/` 不在忽略列表里，提交前请自行确认。请勿将包含教材 PDF 或敏感资料的目录提交到公共仓库。
 
 逐项用途（中英文对照）见 [文件说明_FILE-MAP.md](文件说明_FILE-MAP.md)。
 
@@ -256,7 +280,7 @@ output/                   # 生成好的 PDF 等交付物（可选，不参与�
 2. 使用 FTS5 字符二元组索引召回候选；
 3. 根据标题匹配、章节集中度和内容类型计算排序特征；
 4. 可选使用 lexical embedding 或 Ollama embedding 进行候选重排；
-5. 返回教材名称、原书页码、PDF 页码、章节、证据文本和 `chunk_id`。
+5. 返回教材名称、原书页码、章节、证据文本和 `chunk_id`。
 
 默认 embedding 后端为零依赖的 lexical bigram。它可以改善词法相似度排序，但不具备真正的同义词语义泛化能力。
 
@@ -292,6 +316,9 @@ OCR、Paddle 和 GPU 相关测试应在对应虚拟环境中执行。
 - OCR、版面和表格识别速度取决于本机 GPU、CUDA/cuDNN 和模型缓存。
 - 图片型 PDF 必须经过 OCR，处理时间通常明显长于文字层 PDF。
 - 默认 SQLite 索引适合本地单机工作区，不是多租户数据库服务。
+- Web 工作台的变更类接口只接受 `application/json`（`text/plain` 等返回 415；不带 `Content-Type` 的 curl 和脚本仍可用）；JSON 请求体上限 8 MB，单次上传默认上限 2 GB。
+- Web 工作台对所有请求都校验 `Host`，变更请求还要求 `Origin` 同源，不符返回 403；绑定 `0.0.0.0` 等通配地址时做不了 Host 枚举，改由访问令牌把关。
+- 页面预览图按 900/1200/1600/2000/2600 五档宽度渲染（请求宽度向上取档），缓存按修改时间淘汰、默认上限 256 MB，同一页只有固定几档尺寸的图。
 - lexical embedding 不会自动理解医学同义词；Ollama 等语义后端需要另行配置。
 - 系统只提供教材证据检索，不保证医学内容完整、最新或适用于具体患者。
 

@@ -152,28 +152,42 @@ def extract_concepts(question: str) -> list[str]:
     return result
 
 
-def build_search_queries(question: str) -> list[str]:
-    """Build a small set of complementary queries for multi-pass retrieval."""
+def build_search_queries(question: str, max_passes: int = 4) -> list[str]:
+    """Build a small set of complementary queries for multi-pass retrieval.
+
+    检索遍数是延迟的直接乘数（每遍都是一次完整 search()），所以这里做预算：
+    单字概念（``骨``/``红``）会退化成全表扫描，只留在联合遍里参与打分；选项词
+    合并成一条而不是每个选项各成一遍；末尾按 ``max_passes`` 截断。
+    """
     question = re.sub(r"\s+", " ", question).strip()
     if not question:
         return []
     concepts = extract_concepts(question)
-    queries = [question]
+    strong = [term for term in concepts if len(term) >= 2] or concepts
+    options = extract_options(question)
+    option_terms: list[str] = []
+    for option in options:
+        for term in extract_concepts(option["text"])[:4]:
+            if term not in option_terms:
+                option_terms.append(term)
+    budget = max(1, int(max_passes))
+    queries: list[str] = [question]
     if concepts:
+        # 联合遍保留全部概念（含单字）：单字仍然参与打分，只是不再各自单独成一遍
         queries.append(" ".join(concepts))
         # Searching the first few concepts separately helps when OCR omitted a
         # word or when a question contains generic exam phrasing.
-        queries.extend(concepts[:4])
-    options = extract_options(question)
-    for option in options:
-        option_terms = extract_concepts(option["text"])
-        if option_terms:
-            queries.append(" ".join(option_terms[:4]))
+        # 选项合并遍要预留一格：否则概念一多，它总被末尾截断掉（选择题里选项
+        # 常是题干没出现的关键术语，那正是最需要补召回的一遍）。
+        reserved = 1 if option_terms else 0
+        queries.extend(strong[: max(0, budget - 2 - reserved)])
+    if option_terms:
+        queries.append(" ".join(option_terms[:4]))
     result: list[str] = []
     for query in queries:
         if query and query not in result:
             result.append(query)
-    return result
+    return result[:budget]
 
 
 def _core_title(title: str) -> str:

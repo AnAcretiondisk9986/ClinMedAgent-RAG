@@ -35,6 +35,7 @@ API 概览：
 from __future__ import annotations
 
 import argparse
+import functools
 import hmac
 import ipaddress
 import json
@@ -42,10 +43,13 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
+import sqlite3
 import sys
 import threading
 import time
 import urllib.parse
+import weakref
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,10 +73,50 @@ MAX_JSON_BODY = 8 * 1024 * 1024
 MAX_UPLOAD_SIZE = int(os.environ.get("MEDICAL_RAG_MAX_UPLOAD") or 2 * 1024 * 1024 * 1024)
 COPY_CHUNK = 1024 * 1024
 PDF_CHUNK = 1024 * 1024
+# 预览图宽度档位：缓存键只能用这几档，否则每个窗口宽度都会生成一张新 PNG。
+# 前端（webui/app.js）必须使用同一组数字，改这里要同步改前端。
+RENDER_WIDTH_BUCKETS = (900, 1200, 1600, 2000, 2600)
+# 预览图缓存上限（默认 256 MB，可用 MEDICAL_RAG_WEB_CACHE_MAX_MB 覆盖）
+MAX_CACHE_BYTES = int(os.environ.get("MEDICAL_RAG_WEB_CACHE_MAX_MB") or 256) * 1024 * 1024
+# 每渲染这么多次预览图检查一次缓存总量
+CACHE_PRUNE_EVERY = 50
+# 本机回环主机名：Host/Origin 校验永远接受它们
+LOOPBACK_HOST_NAMES = frozenset({"127.0.0.1", "::1", "localhost"})
+# JSON 请求体允许的 Content-Type（含 +json 后缀）；表单/纯文本属"简单请求"，必须拒绝
+_JSON_CONTENT_TYPES = frozenset({"application/json", "text/json", "application/x-json"})
+_WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::", "[::]", "*"})
+
+
+@functools.lru_cache(maxsize=1)
+def _local_host_names() -> frozenset[str]:
+    """本机可用主机名（Host 头白名单用），失败时返回空集合。
+
+    ``--allow-remote`` 绑定具体网卡时，浏览器多半用 ``http://<机器名>:<端口>``
+    访问；只认绑定 IP 会把正常访问 403 掉。这里收集机器名/FQDN/解析出的别名，
+    通配绑定不走这条路（枚举不出来，靠令牌鉴权）。
+    """
+    names: set[str] = set(LOOPBACK_HOST_NAMES)
+    try:
+        names.add(socket.gethostname().strip().lower().rstrip("."))
+        names.add(socket.getfqdn().strip().lower().rstrip("."))
+        _, aliases, addresses = socket.gethostbyname_ex(socket.gethostname())
+        names.update(alias.strip().lower().rstrip(".") for alias in aliases)
+        names.update(str(address) for address in addresses)
+    except (OSError, UnicodeError):
+        pass
+    return frozenset(name for name in names if name)
 
 
 class UploadTooLarge(ValueError):
     """上传体积超过 MAX_UPLOAD_SIZE（与控制流里的普通 ValueError 区分状态码）。"""
+
+
+class PayloadTooLarge(ValueError):
+    """JSON 请求体超过 MAX_JSON_BODY（应回 413，而不是 500）。"""
+
+
+class UnsupportedMediaType(ValueError):
+    """变更类接口的 Content-Type 不是 application/json（应回 415，挡住 CSRF 简单请求）。"""
 
 
 MAX_FILE_NAME = 120
@@ -122,13 +166,65 @@ def book_lock_key(directory: Path | str) -> str:
     return os.path.normcase(str(Path(directory).resolve()))
 
 
+def bucket_width(width: int | str) -> int:
+    """把请求宽度量化到 ``RENDER_WIDTH_BUCKETS`` 的档位（取 ≥ 请求值的最小档）。
+
+    缓存键只能是有限几档：否则窗口宽 × zoomFactor × dpr 算出的任意整数都会
+    生成一张独立 PNG（实测 175 张 / 71.5 MB / 26 种宽度）。按"向上取档"量化，
+    请求值永远拿到不小于它的图，不会变糊。
+    """
+    try:
+        value = max(1, int(width))
+    except (TypeError, ValueError):
+        value = RENDER_WIDTH_BUCKETS[0]
+    for bucket in RENDER_WIDTH_BUCKETS:
+        if value <= bucket:
+            return bucket
+    return RENDER_WIDTH_BUCKETS[-1]
+
+
+def _prune_cache(app: "WebApp", limit_bytes: int = MAX_CACHE_BYTES) -> int:
+    """按 mtime 从旧到新删预览图，直到缓存总量回到 ``limit_bytes`` 以内。
+
+    返回删除的文件数。只删 ``*.png``，不动 ``.medical_rag`` 下的其它产物；
+    删除失败（被占用）的项直接跳过，不做重试。
+    """
+    if limit_bytes <= 0:
+        return 0
+    entries: list[tuple[float, int, Path]] = []
+    total = 0
+    try:
+        for path in app.cache_dir.rglob("*.png"):
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            entries.append((info.st_mtime, info.st_size, path))
+            total += info.st_size
+    except OSError:
+        return 0
+    if total <= limit_bytes:
+        return 0
+    removed = 0
+    for _mtime, size, path in sorted(entries):
+        if total <= limit_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+    return removed
+
+
 def render_page_png(app: "WebApp", book: dict[str, Any], page_no: int, width: int) -> Path:
-    """把 PDF 某页渲染成 PNG（磁盘缓存，按 PDF mtime 失效）。"""
+    """把 PDF 某页渲染成 PNG（磁盘缓存，按 PDF mtime 失效，宽度按档位量化）。"""
     pdf = Path(book["pdf"])
     if not pdf.exists():
         raise FileNotFoundError(f"PDF 不存在：{pdf}")
     page_no = max(1, int(page_no))
-    width = max(320, min(int(width), 2600))
+    width = bucket_width(width)
     out_dir = app.cache_dir / str(book["id"])
     out = out_dir / f"page-{page_no:04d}-w{width}.png"
     mtime = pdf.stat().st_mtime
@@ -149,6 +245,7 @@ def render_page_png(app: "WebApp", book: dict[str, Any], page_no: int, width: in
         temp = out.with_name(out.stem + ".tmp.png")
         pix.save(str(temp))
         os.replace(temp, out)
+    app.note_render()
     return out
 
 
@@ -167,12 +264,27 @@ class WebApp:
         self.cache_dir = self.root / ".medical_rag" / "web_cache"
         # 非空时启用访问令牌（非本机监听必须启用；本机监听默认为空 = 不鉴权）
         self.token = str(token or "")
+        # hmac.compare_digest 的 str 版本只接受 ASCII，中文口令会直接抛 TypeError
+        self.token_bytes = self.token.encode("utf-8")
         self.allow_local_paths = bool(allow_local_paths)
         self.asset_cache = "private, max-age=86400" if self.token else "public, max-age=86400"
         self.tasks = TaskManager()
         self.render_lock = threading.Lock()
         self._books_lock = threading.Lock()
         self._books_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
+        # 常驻连接：ThreadingHTTPServer 每个连接一个线程，所以按线程各持一条
+        # Library（sqlite 连接不能跨线程共享），请求结束不关闭。
+        self._local = threading.local()
+        self._lib_lock = threading.Lock()
+        self._libraries: "weakref.WeakSet[Library]" = weakref.WeakSet()
+        # sqlite 连接只能由创建它的线程关闭。close_libraries() 在收尾线程里遇到
+        # 别的线程的连接时不能真的 close()，只能登记“请关闭”（见 Library.request_close），
+        # 记账在这里，避免用 except Exception: pass 假装收尾成功。
+        self._pending_close: "weakref.WeakSet[Library]" = weakref.WeakSet()
+        self._close_errors: list[str] = []
+        # 预览图缓存清理：渲染计数 + 独立锁（不占用 render_lock）
+        self._cache_lock = threading.Lock()
+        self._render_count = 0
 
     # ------------------------------------------------------------------ 书库
     def books(self, max_age: float = 1.5) -> list[dict[str, Any]]:
@@ -192,7 +304,120 @@ class WebApp:
         return next((book for book in self.books() if book["id"] == book_id), None)
 
     def library(self) -> Library:
-        return Library(self.db, root=self.root)
+        """返回**本线程**的常驻 Library（连接复用，请求结束不关闭）。
+
+        开一条 ``Library`` 要跑一遍全量 DDL + 两轮 backfill（实测 186 ms），
+        而真正要跑的查询只要 0.1 ms 级；每次请求新建连接是纯浪费，而且
+        ``_init_schema`` 里的 ``PRAGMA user_version`` 写会让读接口也去抢写锁
+        （重建索引期间整站读接口会卡到 busy_timeout 30 s 后 500）。
+        """
+        library = getattr(self._local, "library", None)
+        if library is not None:
+            return library
+        with self._lib_lock:
+            library = getattr(self._local, "library", None)
+            if library is None:
+                library = Library(self.db, root=self.root)
+                self._local.library = library
+                self._libraries.add(library)
+        return library
+
+    def warm_library(self) -> None:
+        """启动时预热本线程的常驻连接，把首查的开关库开销挪到启动阶段。
+
+        索引库还不存在时直接跳过：``Library()`` 会建库，而"只读接口不建库"
+        是 ``tests/test_webapp.py::HealthTests`` 明确守护的契约。
+        """
+        try:
+            if not Path(self.db).exists():
+                return
+        except OSError:
+            return
+        try:
+            self.library()
+        except Exception:  # noqa: BLE001 - 预热失败不影响服务，首次请求会重试
+            pass
+
+    def invalidate_library(self) -> None:
+        """写入口完成后失效本线程的常驻连接（其它线程靠 WAL 自动看到新提交）。"""
+        library = getattr(self._local, "library", None)
+        if library is None:
+            return
+        self._local.library = None
+        self._close_library(library)
+
+    def release_thread_library(self) -> None:
+        """连接关闭时释放本线程的常驻连接。
+
+        ``ThreadingHTTPServer`` 每个连接一个线程：keep-alive 连接在处理完所有
+        请求后才走到这里，所以连接复用不受影响；而 ``Connection: close`` 的
+        客户端（curl / 脚本 / urllib）每次请求都换线程，必须在这里回收，否则
+        每条连接都会留下一条再没人用的 sqlite 连接。
+        """
+        library = getattr(self._local, "library", None)
+        if library is None:
+            return
+        self._local.library = None
+        self._close_library(library)
+
+    def close_libraries(self) -> None:
+        """收尾：关闭所有线程的常驻连接（进程退出 / server_close 时调用）。
+
+        诚实的合同：sqlite 连接**只能由创建它的线程关闭**（``check_same_thread``），
+        所以这里只能真正关闭“调用线程自己的”连接；别的线程的连接一律
+        ``Library.request_close()`` 登记，由 owner 线程在下一次使用
+        （``Library._ensure_open``）或 ``release_thread_library()`` 时关闭。
+
+        以前这里用 ``except Exception: pass`` 吞掉跨线程的 ``ProgrammingError``，
+        结果 ``_libraries`` 账清零了、连接却还活着：收尾看起来成功，其实没有。
+        """
+        current = threading.get_ident()
+        with self._lib_lock:
+            # 之前登记过、但 owner 线程已经关掉的连接随手清掉，账本才能收敛
+            libraries = [item for item in self._libraries if not item.closed]
+            libraries += [item for item in self._pending_close if not item.closed]
+            self._libraries.clear()
+            self._pending_close.clear()
+        local = getattr(self._local, "library", None)
+        self._local.library = None
+        if local is not None and not local.closed and local not in libraries:
+            libraries.append(local)
+        for item in libraries:
+            if item.owner_thread == current:
+                self._close_library(item)
+                continue
+            # 其它线程创建的连接：不能在这里 close()，登记后由其 owner 线程收尾
+            item.request_close()
+            with self._lib_lock:
+                self._pending_close.add(item)
+
+    def _close_library(self, library: Library) -> None:
+        """在 owner 线程里关闭一条常驻连接。
+
+        跨线程调用会抛 ``sqlite3.ProgrammingError``：不静默吞掉，记进
+        ``_close_errors`` 并转成“登记关闭”，由 owner 线程补关。
+        """
+        with self._lib_lock:
+            self._libraries.discard(library)
+            self._pending_close.discard(library)
+        try:
+            library.close()
+        except sqlite3.Error as exc:
+            with self._lib_lock:
+                self._close_errors.append(f"{type(exc).__name__}: {exc}")
+                self._pending_close.add(library)
+            library.request_close()
+
+    def note_render(self) -> None:
+        """登记一次预览图渲染；每 ``CACHE_PRUNE_EVERY`` 次检查一次缓存总量。"""
+        self._render_count += 1
+        if self._render_count % CACHE_PRUNE_EVERY:
+            return
+        with self._cache_lock:
+            try:
+                _prune_cache(self)
+            except Exception:  # noqa: BLE001 - 清缓存失败不能影响出图
+                pass
 
     def overview(self, port: int | None = None) -> dict[str, Any]:
         from .embeddings import create_backend_cached
@@ -230,6 +455,14 @@ class Handler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):
             super().log_message(fmt, *args)
 
+    def finish(self) -> None:
+        """连接收尾：释放本线程的常驻 Library（keep-alive 连接处理完所有请求才到这里）。"""
+        try:
+            self.app.release_thread_library()
+        except Exception:  # noqa: BLE001 - 收尾阶段不再抛
+            pass
+        super().finish()
+
     # --------------------------------------------------------------- 鉴权
     def _cookie_token(self) -> str:
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -244,15 +477,105 @@ class Handler(BaseHTTPRequestHandler):
         查询参数/ Cookie 是必需的：封面、预览图和 PDF 都用 <img src> / 链接加载，
         无法附加自定义请求头。
         """
-        token = self.app.token
-        if not token:
+        if not self.app.token_bytes:
             return True
         candidates = (
             self.headers.get("X-Auth-Token") or "",
             (query.get("token") or [""])[0],
             self._cookie_token(),
         )
-        return any(value and hmac.compare_digest(str(value), token) for value in candidates)
+        # 统一编码成 bytes 再比较：hmac.compare_digest 的 str 版本只接受 ASCII，
+        # 中文口令会抛 TypeError 让每个请求都 500。
+        return any(
+            value and hmac.compare_digest(str(value).encode("utf-8"), self.app.token_bytes)
+            for value in candidates
+        )
+
+    # ------------------------------------------------- 跨站 / 重绑定防护
+    def _host_allowed(self) -> bool:
+        """Host 头必须是本机名或本站实际绑定的地址（防 DNS rebinding）。
+
+        DNS rebinding 下浏览器会带 ``Host: evil.example.com`` 来访问 127.0.0.1，
+        只认回环名与 ``--host`` 传入的绑定地址即可挡住。
+        """
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return True  # HTTP/1.0 客户端可能不带 Host
+        try:
+            hostname = (urllib.parse.urlsplit("//" + raw).hostname or "").strip().lower().rstrip(".")
+        except ValueError:
+            return False
+        if not hostname:
+            return False
+        if hostname in LOOPBACK_HOST_NAMES:
+            return True
+        allowed = getattr(self.server, "allowed_hosts", None)
+        if allowed is None:  # 通配绑定（0.0.0.0 / ::）：枚举不出来，只靠令牌鉴权
+            return True
+        return hostname in allowed
+
+    def _origin_allowed(self) -> bool:
+        """变更类请求的跨站防护：有 Origin / Sec-Fetch-Site 时必须同源。
+
+        缺失时放行——curl、脚本、现有测试都不带这些头；浏览器跨站请求一定带
+        Origin（或 Sec-Fetch-Site: cross-site），所以宽松实现同样能挡住 CSRF。
+        """
+        if (self.headers.get("Sec-Fetch-Site") or "").strip().lower() == "cross-site":
+            return False
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        if parsed.scheme not in ("http", "https"):
+            return False  # 含 Origin: null（file:// / 沙箱 iframe）
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not hostname:
+            return False
+        # 同源比较必须带上端口：只比主机名会让本机其它端口（另一个 dev server、
+        # Jupyter、本项目的第二个实例）发起的请求也被判成同源，CSRF 防护形同虚设。
+        try:
+            request = urllib.parse.urlsplit("//" + (self.headers.get("Host") or "").strip())
+        except ValueError:
+            return False
+        request_host = (request.hostname or "").strip().lower().rstrip(".")
+        if not request_host:
+            return False
+        expected_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        actual_port = request.port or (443 if parsed.scheme == "https" else 80)
+        if expected_port != actual_port:
+            return False
+        if hostname == request_host:
+            return True
+        # Host 可能写机器名、Origin 写回环 IP（或反之）：回环名之间互认，但端口
+        # 必须一致（上面已验证）。
+        if hostname in LOOPBACK_HOST_NAMES and request_host in LOOPBACK_HOST_NAMES:
+            return True
+        allowed = getattr(self.server, "allowed_hosts", None)
+        if allowed is None:
+            return False
+        return hostname in allowed
+
+    def _guard_request(self, mutating: bool = False) -> bool:
+        """入口统一防护；返回 False 表示已经回过 403。"""
+        if not self._host_allowed():
+            self._reject_cross_site(403, "Host 不在允许列表内（本站只接受本机或绑定的地址）")
+            return False
+        if mutating and not self._origin_allowed():
+            self._reject_cross_site(403, "拒绝跨站请求：Origin 与本站不同源")
+            return False
+        return True
+
+    def _reject_cross_site(self, status: int, message: str) -> None:
+        """回 403 前先把请求体读掉，避免 Windows 上直接关连接变成 RST。"""
+        try:
+            if self.command in ("POST", "PUT", "PATCH"):
+                self._drain_body(COPY_CHUNK)
+        except Exception:  # noqa: BLE001 - 读体失败不影响回 403
+            self.close_connection = True
+        self._send_error_json(status, message)
 
     def _remember_token(self, query: dict[str, list[str]]) -> None:
         """带 ?token= 访问时种下 Cookie，后续静态资源/图片/PDF 自动携带。"""
@@ -308,12 +631,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body, content_type, cache=cache)
 
+    def _json_content_type(self) -> bool:
+        """变更类接口的 Content-Type 是否可接受（容忍 ``; charset=`` 与 ``+json``）。"""
+        raw = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not raw:
+            return True  # curl / 脚本常常不带 Content-Type
+        return raw in _JSON_CONTENT_TYPES or raw.endswith("+json")
+
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return {}
         if length > MAX_JSON_BODY:
-            raise ValueError("请求体过大")
+            raise PayloadTooLarge("请求体过大")
+        if not self._json_content_type():
+            raise UnsupportedMediaType(
+                "变更类接口只接受 application/json；text/plain 等简单请求属于 CSRF 载体，已拒绝"
+            )
         raw = self.rfile.read(length)
         if not raw:
             return {}
@@ -334,6 +668,8 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------- GET
     def do_GET(self) -> None:  # noqa: N802
         try:
+            if not self._guard_request():
+                return
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
             query = urllib.parse.parse_qs(parsed.query)
@@ -391,14 +727,12 @@ class Handler(BaseHTTPRequestHandler):
             data = dict(book)
             index = book["status"]["index"]
             if index.get("book_id"):
+                # 常驻连接：请求结束不关闭（见 WebApp.library）
                 library = self.app.library()
-                try:
-                    library_row = library.get_book(index["book_id"])
-                    data["index_book"] = library_row
-                    page_range = library.page_range(index["book_id"])
-                    data["page_range"] = {"min": page_range[0], "max": page_range[1]} if page_range else None
-                finally:
-                    library.close()
+                library_row = library.get_book(index["book_id"])
+                data["index_book"] = library_row
+                page_range = library.page_range(index["book_id"])
+                data["page_range"] = {"min": page_range[0], "max": page_range[1]} if page_range else None
             return self._send_data(self._trim(data))
 
         if not book.get("pdf"):
@@ -426,11 +760,7 @@ class Handler(BaseHTTPRequestHandler):
         index = book["status"]["index"]
         if not index.get("book_id"):
             return {"page": page_no, "indexed": False, "chunks": []}
-        library = self.app.library()
-        try:
-            chunks = library.chunks_for_page(index["book_id"], page_no)
-        finally:
-            library.close()
+        chunks = self.app.library().chunks_for_page(index["book_id"], page_no)
         return {
             "page": page_no,
             "indexed": True,
@@ -450,14 +780,16 @@ class Handler(BaseHTTPRequestHandler):
         if range_header and size:
             match = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
             if match:
-                if match.group(1):
-                    start = int(match.group(1))
-                if match.group(2):
-                    end = int(match.group(2))
-                if not match.group(1) and match.group(2):  # bytes=-N
-                    start = max(0, size - int(match.group(2)))
-                end = min(end, size - 1)
-                if start > end:
+                first, last = match.group(1), match.group(2)
+                if first and last:            # bytes=a-b
+                    start, end = int(first), min(int(last), size - 1)
+                elif first:                   # bytes=a-
+                    start, end = int(first), size - 1
+                elif last:                    # bytes=-N：末尾 N 字节（PDF 阅读器读尾部交叉引用表要用）
+                    start, end = max(0, size - int(last)), size - 1
+                else:                         # bytes=-：等同整个文件
+                    start, end = 0, size - 1
+                if start >= size or start > end:
                     return self._send(416, b"", "application/pdf", extra={"Content-Range": f"bytes */{size}"})
                 status = 206
         self.send_response(status)
@@ -495,6 +827,8 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ POST
     def do_POST(self) -> None:  # noqa: N802
         try:
+            if not self._guard_request(mutating=True):
+                return
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
             parts = [segment for segment in path.split("/") if segment]
@@ -520,6 +854,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json(404, "没有这个接口")
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except PayloadTooLarge as exc:
+            # 与 401/415 分支一致：先把已经到达的请求体读掉再回 413。带未读数据
+            # 直接关连接，Windows 会发 RST，客户端拿到 WinError 10053 而不是 413
+            # （_drain_body 的 docstring 已说明；实测 200 次里 18 次丢响应）。
+            self._drain_body()
+            self.close_connection = True
+            self._send_error_json(413, str(exc))
+        except UnsupportedMediaType as exc:
+            self._drain_body(COPY_CHUNK)
+            self._send_error_json(415, str(exc))
+        except (ValueError, TypeError) as exc:
+            # 客户端错误（坏 JSON / 非法数值 / 非对象体）不该回 500
+            self._send_error_json(400, f"{type(exc).__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
@@ -577,6 +924,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not created:
             return self._send_conflict(task, f"《{book_name}》已有任务在运行，请等它结束")
+        self.app.invalidate_library()
         self._send_data({"task_id": task.id})
 
     def _pdf_conflict(self, title: str, filename: str) -> bool:
@@ -655,7 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(stages, (list, str)):
             return self._send_error_json(400, "stages 必须是数组或 auto")
         force = bool(body.get("force", False))
-        dpi = int(body.get("dpi") or 300)
+        dpi = _body_int(body, "dpi", 300, 72, 600)
         device = str(body.get("device") or "gpu")
         reset_ocr = bool(body.get("reset_ocr", False))
 
@@ -673,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not created:
             return self._send_conflict(task, f"《{book['title']}》已有任务在运行，请等它结束")
+        self.app.invalidate_library()
         self._send_data({"task_id": task.id})
 
     def _post_reindex(self) -> None:
@@ -693,6 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not created:
             return self._send_conflict(task, f"《{book['title']}》已有任务在运行，请等它结束")
+        self.app.invalidate_library()
         self._send_data({"task_id": task.id})
 
     def _post_search(self) -> None:
@@ -700,22 +1050,19 @@ class Handler(BaseHTTPRequestHandler):
         query = str(body.get("query") or "").strip()
         if not query:
             return self._send_error_json(400, "检索词不能为空")
-        limit = max(1, min(int(body.get("limit") or 8), 20))
+        limit = _body_int(body, "limit", 8, 1, 20)
         book_id = body.get("book_id")
         scope = None
         library = self.app.library()
-        try:
-            if book_id not in (None, "", "all"):
-                index_id = self._resolve_index_book_id(book_id, library)
-                if index_id is None:
-                    return self._send_error_json(400, "没有这本教材，或该教材尚未建立索引")
-                row = library.get_book(index_id)
-                scope = {"id": index_id, "title": row["title"] if row else str(book_id)}
-                results = library.search(query, limit, book=index_id)
-            else:
-                results = library.search(query, limit)
-        finally:
-            library.close()
+        if book_id not in (None, "", "all"):
+            index_id = self._resolve_index_book_id(book_id, library)
+            if index_id is None:
+                return self._send_error_json(400, "没有这本教材，或该教材尚未建立索引")
+            row = library.get_book(index_id)
+            scope = {"id": index_id, "title": row["title"] if row else str(book_id)}
+            results = library.search(query, limit, book=index_id)
+        else:
+            results = library.search(query, limit)
         self._send_data({"query": query, "results": results, "scope": scope})
 
     def _resolve_index_book_id(self, book_id: Any, library: Library) -> int | None:
@@ -739,6 +1086,8 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------- PUT
     def do_PUT(self) -> None:  # noqa: N802
         try:
+            if not self._guard_request(mutating=True):
+                return
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
             parts = [segment for segment in path.split("/") if segment]
@@ -752,6 +1101,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json(404, "没有这个接口")
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except (PayloadTooLarge, UploadTooLarge) as exc:
+            self.close_connection = True
+            self._send_error_json(413, str(exc))
+        except (ValueError, TypeError) as exc:
+            self._send_error_json(400, f"{type(exc).__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001
             self._send_error_json(500, f"{type(exc).__name__}: {exc}")
 
@@ -772,6 +1126,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json(411, "缺少 Content-Length 或文件为空")
         if length > MAX_UPLOAD_SIZE:
             task.mark_error(f"文件 {length} 字节超过上限 {MAX_UPLOAD_SIZE} 字节")
+            # 先把已到达的字节读掉再回 413，否则带未读数据关连接会被 Windows 发 RST，
+            # 客户端拿到 WinError 10053 而不是 413（同 _drain_body 的 docstring）
+            self._drain_body()
             self.close_connection = True
             return self._send_error_json(
                 413, f"文件超过上限（{MAX_UPLOAD_SIZE / 1024 / 1024:.0f} MB）"
@@ -855,6 +1212,7 @@ class Handler(BaseHTTPRequestHandler):
             task.log(f"警告：PDF 文字层检测失败（文件本身有效）：{exc}")
         task.mark_done(f"上传完成：{target}")
         self.app.invalidate_books()
+        self.app.invalidate_library()
         self._send_data({"task_id": task.id, "path": str(target), "book_dir": str(book_dir)})
 
     # ------------------------------------------------------------------ HEAD
@@ -870,6 +1228,27 @@ class MedicalHTTPServer(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.app = app
         self.verbose = verbose
+        self.bind_host = str(address[0])
+        # Host 头白名单：通配绑定（0.0.0.0 / ::）枚举不出合法主机名，只能用 None
+        # 表示"不校验"，那种情况下必须靠令牌鉴权（--allow-remote 会强制生成令牌）。
+        name = self.bind_host.strip().lower().rstrip(".")
+        if name in _WILDCARD_HOSTS:
+            self.allowed_hosts = None
+        else:
+            hosts = {name}
+            # 本机机器名与 localhost 也接受：--allow-remote 绑定具体网卡时，浏览器
+            # 通常用 http://<机器名>:<端口> 访问，只认绑定 IP 会把正常请求 403 掉。
+            for candidate in _local_host_names():
+                hosts.add(candidate)
+            self.allowed_hosts: frozenset[str] | None = frozenset(hosts)
+
+    def server_close(self) -> None:
+        """关闭监听后统一收尾常驻 Library 连接（WAL 收尾 checkpoint 落在这里）。"""
+        super().server_close()
+        try:
+            self.app.close_libraries()
+        except Exception:  # noqa: BLE001 - 收尾阶段不再抛
+            pass
 
 
 def _int_arg(query: dict[str, list[str]], key: str, default: int) -> int:
@@ -877,6 +1256,19 @@ def _int_arg(query: dict[str, list[str]], key: str, default: int) -> int:
         return int(query.get(key, [default])[0])
     except (TypeError, ValueError):
         return default
+
+
+def _body_int(body: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    """取 JSON 体里的数值字段：非法值回落默认值，再夹到 ``[low, high]``。
+
+    裸 ``int(body.get("limit"))`` 遇到 ``"abc"`` 会抛 ValueError，最后变成 500
+    + Python 类名，前端只能看到一个错误框。
+    """
+    try:
+        value = int(body.get(key) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
 
 
 def create_server(
@@ -889,6 +1281,7 @@ def create_server(
     token: str = "",
 ) -> MedicalHTTPServer:
     app = WebApp(root, db, token=token, allow_local_paths=is_loopback(host))
+    app.warm_library()  # 把首查的开关库开销挪到启动阶段
     last_error: OSError | None = None
     for offset in range(port_attempts):
         try:

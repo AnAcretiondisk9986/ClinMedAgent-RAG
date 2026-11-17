@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -187,6 +191,80 @@ class FtsIndexConsistencyTests(unittest.TestCase):
             finally:
                 first.close()
                 second.close()
+
+
+class McpLimitTests(unittest.TestCase):
+    """F2：MCP 客户端传 ``{"limit": null}`` 时必须回正常工具结果。
+
+    以前 ``mcp_server`` 把原始 JSON 值直塞给 ``Library.search()``，
+    ``int(None)`` 变成 ``isError`` 工具结果，客户端只看得到一条 TypeError。
+    走真实子进程 + stdio，顺带覆盖 main() 的读写循环。
+    """
+
+    def _run_mcp(self, db: Path, requests: list[dict]) -> list[dict]:
+        payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in requests) + "\n"
+        env = {**os.environ, "MEDICAL_RAG_DB": str(db)}
+        process = subprocess.run(
+            [sys.executable, "-m", "medical_rag.mcp_server"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=180,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(process.returncode, 0, process.stderr[-1000:])
+        return [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
+
+    def test_limit_null_is_a_normal_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            structured = root / "structured"
+            structured.mkdir()
+            (structured / "01.md").write_text(
+                "# 第一章\n\n## 原书第 18 页\n\n上皮组织由密集排列的上皮细胞和少量细胞外基质组成。\n",
+                encoding="utf-8",
+            )
+            db = root / "library.sqlite3"
+            lib = Library(db)
+            try:
+                lib.ingest_markdown_tree(root, "测试教材")
+            finally:
+                lib.close()
+            responses = self._run_mcp(
+                db,
+                [
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "search_medical_books",
+                            "arguments": {"query": "上皮组织", "limit": None},
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "answer_medical_question",
+                            "arguments": {"question": "上皮组织由什么组成", "limit": None},
+                        },
+                    },
+                ],
+            )
+        by_id = {item.get("id"): item for item in responses}
+        search = by_id[2]["result"]
+        self.assertNotIn("isError", search, f"limit=null 变成了工具错误：{search}")
+        self.assertTrue(search["structuredContent"])
+        self.assertEqual(search["structuredContent"][0]["page"], 18)
+        answer = by_id[3]["result"]
+        self.assertNotIn("isError", answer, f"limit=null 变成了工具错误：{answer}")
+        self.assertEqual(answer["structuredContent"]["status"], "evidence_found")
 
 
 if __name__ == "__main__":

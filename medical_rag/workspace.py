@@ -11,14 +11,68 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from .library import DEFAULT_DB
 from .paths import absolute_path, relative_key, root_for_db
 from .pdftext import cached_analyze
 
 PDF_PAGE_CACHE: dict[tuple[str, float], int] = {}
+# 库读不了时只在 stderr 提示一次，避免书库轮询把同一条警告刷满日志
+_UNREADABLE_DB_WARNED: set[str] = set()
+
+
+def open_readonly(db_path: Path | str) -> sqlite3.Connection:
+    """以**只读** URI 打开索引库；打不开只读时退回 ``immutable=1``。
+
+    诊断与书库扫描只是读书，不能用 ``sqlite3.connect(path)``（读写模式会创建
+    -wal/-shm 并可能写库；只读介质上直接报 ``unable to open database file``）。
+    而只读介质/受限 ACL 下 ``mode=ro`` 也可能因加锁失败，``immutable=1``
+    （不加锁、假定文件不变）是最后一条可行路径。
+
+    连接成功后统一 ``PRAGMA query_only = 1``，确保调用方也不会误写。
+
+    注意 ``mode=ro`` 的 connect 是惰性的：WAL 模式的库在只读介质上能连上，
+    第一次真正读页时才会报 ``unable to open database file``。所以这里连上后
+    立刻做一次哨兵查询，失败就整体退回 ``immutable=1``。
+    """
+    path = Path(db_path).expanduser()
+    uri = "file:" + quote(path.as_posix(), safe="/:")
+    errors: list[str] = []
+    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+        try:
+            connection = sqlite3.connect(uri + suffix, uri=True)
+        except sqlite3.OperationalError as exc:
+            errors.append(str(exc))
+            continue
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = 1")
+            # 哨兵：不落到真实读取前，惰性连接不会暴露 WAL/加锁问题
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return connection
+        except sqlite3.Error as exc:
+            errors.append(str(exc))
+            connection.close()
+    raise sqlite3.OperationalError("；".join(errors) or f"无法只读打开：{path}")
+
+
+def warn_unreadable_db(db_path: Path | str, exc: BaseException | None = None) -> None:
+    """库读不了时记一条 warning（同一路径只报一次）。"""
+    key = os.path.normcase(str(db_path))
+    if key in _UNREADABLE_DB_WARNED:
+        return
+    _UNREADABLE_DB_WARNED.add(key)
+    detail = f"（{exc}）" if exc else ""
+    print(
+        f"警告：索引库无法以只读方式打开：{db_path}{detail}；书库状态会显示为未建索引",
+        file=sys.stderr,
+        flush=True,
+    )
+
 _INVALID_DIR_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # Windows 保留设备名：即使带扩展名（CON.pdf、NUL.pdf）也无法创建，目录名与
 # 文件名共用这一份定义，避免两处实现漂移
@@ -98,8 +152,7 @@ def load_db_books(db: Path | str = DEFAULT_DB, root: Path | str | None = None) -
         return []
     base = Path(root).expanduser().resolve() if root else root_for_db(db_path)
     try:
-        connection = sqlite3.connect(db_path)
-        connection.row_factory = sqlite3.Row
+        connection = open_readonly(db_path)
         try:
             rows = connection.execute("SELECT * FROM books ORDER BY id").fetchall()
             stats = {
@@ -123,7 +176,9 @@ def load_db_books(db: Path | str = DEFAULT_DB, root: Path | str | None = None) -
             return books
         finally:
             connection.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        # 库读不了 ≠ 库里没有书：静默返回 [] 会让 UI 把 4 本书全报成“未建索引”
+        warn_unreadable_db(db_path, exc)
         return []
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from .bridge import _positive_int
 from .library import Library
 
 
@@ -23,6 +24,8 @@ def _public_text(name: str, data: object) -> str:
         items = data if isinstance(data, list) else []
         return "\n\n".join(_public_evidence(item) for item in items) if items else "本地教材知识库没有检索到证据。"
     if name == "get_book_section":
+        if data is None:
+            return "未找到该证据块（chunk_id 可能已失效，请重新调用 search_medical_books）"
         return _public_evidence(data)
     if name == "answer_medical_question" and isinstance(data, dict):
         lines = [f"状态：{data.get('status', '未知')}"]
@@ -45,16 +48,38 @@ def _out(payload: dict) -> None:
     sys.stdout.flush()
 
 
+class LibraryUnavailable(RuntimeError):
+    """本地书库打不开（索引缺失 / 只读 / 路径错）：回 JSON-RPC error，但不退出进程。"""
+
+
 def main() -> None:
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
-    library = Library()
+    # 书库延迟到首次 tools/call 再打开：打不开时只是每条请求回 error，
+    # 而不是让整个 MCP 进程在启动阶段就带着 traceback 退出（客户端只看到 EOF）。
+    state: dict = {"library": None, "error": ""}
+
+    def get_library() -> Library:
+        if state["library"] is not None:
+            return state["library"]
+        if state["error"]:
+            raise LibraryUnavailable(state["error"])
+        try:
+            state["library"] = Library()
+        except Exception as exc:  # noqa: BLE001 - 任何打开失败都要变成可应答的错误
+            state["error"] = f"{type(exc).__name__}: {exc}"
+            raise LibraryUnavailable(state["error"]) from exc
+        return state["library"]
+
     for raw in sys.stdin:
         if not raw.strip():
             continue
         request = {}
         try:
             request = json.loads(raw)
+            if not isinstance(request, dict):
+                # JSON-RPC batch 数组（[1,2] 之类）暂时不支持：给一条错误而不是崩掉
+                raise ValueError("请求必须是 JSON 对象（暂不支持 batch 数组）")
             request_id = request.get("id")
             method = request.get("method")
             params = request.get("params") or {}
@@ -79,22 +104,46 @@ def main() -> None:
             elif method == "tools/call":
                 name = params.get("name")
                 args = params.get("arguments") or {}
-                if name == "list_books":
-                    data = library.list_books()
-                elif name == "search_medical_books":
-                    data = library.search(args.get("query", ""), args.get("limit", 5), book=args.get("book"))
-                elif name == "get_book_section":
-                    data = library.get_chunk(args.get("chunk_id", ""))
-                elif name == "answer_medical_question":
-                    data = library.answer_question(args.get("question", ""), args.get("limit", 6), book=args.get("book"))
-                else:
-                    raise ValueError(f"未知工具：{name}")
+                if not isinstance(args, dict):
+                    args = {}
+                try:
+                    lib = get_library()
+                    if name == "list_books":
+                        data = lib.list_books()
+                    elif name == "search_medical_books":
+                        # 复用 bridge 的兜底：LLM 客户端会把 limit 传成 null/字符串，
+                        # 裸值直接进 Library 会变成一条无信息量的 TypeError 工具错误
+                        data = lib.search(
+                            args.get("query", ""),
+                            _positive_int(args.get("limit"), 5),
+                            book=args.get("book"),
+                        )
+                    elif name == "get_book_section":
+                        data = lib.get_chunk(args.get("chunk_id", ""))
+                    elif name == "answer_medical_question":
+                        data = lib.answer_question(
+                            args.get("question", ""),
+                            _positive_int(args.get("limit"), 6),
+                            book=args.get("book"),
+                        )
+                    else:
+                        raise ValueError(f"未知工具：{name}")
+                except LibraryUnavailable as exc:
+                    _out({"jsonrpc":"2.0","id":request_id,"error":{"code":-32000,"message":f"本地书库不可用：{exc}"}})
+                    continue
+                except Exception as exc:  # noqa: BLE001 - 工具内部异常用 tool result 表达
+                    _out({"jsonrpc":"2.0","id":request_id,"result":{
+                        "content":[{"type":"text","text":f"工具执行失败：{type(exc).__name__}: {exc}"}],
+                        "isError": True
+                    }})
+                    continue
                 text = _public_text(name, data)
                 _out({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":text}],"structuredContent":data}})
             else:
                 _out({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":f"未知方法：{method}"}})
         except Exception as exc:
-            _out({"jsonrpc":"2.0","id":request.get("id"),"error":{"code":-32000,"message":str(exc)}})
+            request_id = request.get("id") if isinstance(request, dict) else None
+            _out({"jsonrpc":"2.0","id":request_id,"error":{"code":-32000,"message":str(exc)}})
 
 
 if __name__ == "__main__":

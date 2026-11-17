@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -24,7 +27,7 @@ from typing import Any, Callable
 import fitz
 
 from .pdftext import cached_analyze, kind_label
-from .tasks import Task, TaskCancelled
+from .tasks import Task, TaskCancelled, kill_process_tree
 from .workspace import safe_dir_name
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
@@ -53,6 +56,89 @@ _TABLE_PAGE_DONE = re.compile(r"^\[第(\d+)页\]")
 _FIX_DONE = re.compile(r"修改文件数[:：]\s*(\d+)")
 _CHAPTER_DONE = re.compile(r"^第(\d+)章[\s:：]")
 _INDEX_DONE = re.compile(r"已处理《")
+
+# 各阶段的超时预算（秒）。``None`` 表示按页数估算（见 :func:`_stage_timeout`）。
+# 一次静默死锁就会让这本书永久持有写入权（前端永远 409），所以必须有上限。
+STAGE_TIMEOUTS: dict[str, int | None] = {
+    "text": 1800,
+    "ocr": None,
+    "layout": 1200,
+    "tables": 1200,
+    "fix": 900,
+    "structure": 1200,
+    "index": 900,
+}
+# 环境变量覆盖单个阶段：MEDICAL_RAG_STAGE_TIMEOUT_<阶段名大写>
+_TIMEOUT_ENV = "MEDICAL_RAG_STAGE_TIMEOUT_"
+
+
+def _stage_timeout(ctx: PipelineContext, stage: str) -> int | None:
+    """该阶段允许跑多久（秒）；``None`` 表示不限时。
+
+    环境变量优先（``<=0`` 视为不限），否则取 :data:`STAGE_TIMEOUTS`；
+    OCR 阶段按页数估算——固定值对 300 页扫描件太紧、对 30 页又太松。
+    """
+    override = os.environ.get(_TIMEOUT_ENV + stage.upper())
+    if override is not None:
+        try:
+            value = int(float(override))
+        except (TypeError, ValueError):
+            return STAGE_TIMEOUTS.get(stage)
+        return value if value > 0 else None
+    if stage == "ocr" and STAGE_TIMEOUTS.get("ocr") is None:
+        return max(600, 12 * book_pages(ctx))
+    return STAGE_TIMEOUTS.get(stage)
+
+
+def _reap(process: Any) -> None:
+    """回收子进程句柄；已退出、超时、以及只实现 ``wait()`` 的测试替身都不抛。"""
+    try:
+        process.wait(timeout=5)
+    except TypeError:  # 测试替身的最小 wait() 不接受 timeout
+        try:
+            process.wait()
+        except OSError:
+            pass
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+_EOF = object()
+
+
+def _pump_stdout(stream: Any, sink: "queue.Queue[Any]") -> None:
+    """后台线程把 stdout 逐行塞进队列（EOF 时放哨兵）。
+
+    直接 ``for line in process.stdout`` 会阻塞在管道 EOF 上：paddle /
+    onnxruntime 的孙进程只要还握着管道，子进程早就退出了也读不到 EOF。
+    """
+    try:
+        for line in stream:
+            sink.put(line)
+    except (OSError, ValueError):
+        pass
+    finally:
+        # 管道由读线程关闭：主线程 close() 时若读线程正卡在 read 上（子进程已退出、
+        # 孙进程仍握着管道），会一直持着 BufferedReader 锁，导致 close() 永不返回。
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+        sink.put(_EOF)
+
+
+def _pdf_fingerprint(path: Path) -> str:
+    """页图缓存用的 PDF 指纹（size + mtime）。
+
+    同目录同名换一版 PDF 时，旧页图必须整体作废，否则新书的表格 HTML 会
+    对着旧页出内容，页码全错却静默入索引。
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return "nofile"
+    return f"{stat.st_size:x}_{int(stat.st_mtime):x}"
+
 
 
 @dataclass
@@ -253,7 +339,7 @@ def stage_command(ctx: PipelineContext, stage: str, force: bool = False) -> list
             "--device",
             ctx.device,
             "--cache",
-            str(root / BUILD_DIR_NAME / "cache" / f"render_layout_{safe_dir_name(ctx.book_dir.name)}"),
+            str(root / BUILD_DIR_NAME / "cache" / f"render_layout_{safe_dir_name(ctx.book_dir.name)}_{_pdf_fingerprint(ctx.pdf)}"),
         ]
     if stage == "tables":
         return [
@@ -264,7 +350,7 @@ def stage_command(ctx: PipelineContext, stage: str, force: bool = False) -> list
             "--layout",
             str(ctx.text_dir / "layout.json"),
             "--cache",
-            str(root / BUILD_DIR_NAME / "cache" / f"render300_{safe_dir_name(ctx.book_dir.name)}"),
+            str(root / BUILD_DIR_NAME / "cache" / f"render300_{safe_dir_name(ctx.book_dir.name)}_{_pdf_fingerprint(ctx.pdf)}"),
             "--device",
             ctx.device,
         ]
@@ -385,6 +471,10 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
     task.log("$ " + " ".join(str(part) for part in command))
     total_hint = _stage_total_hint(ctx, stage)
     task.start_stage(stage, STAGE_LABELS[stage], total=total_hint, message="启动中…")
+    timeout = _stage_timeout(ctx, stage)
+    if timeout:
+        # 误杀时长 OCR 的唯一线索就是这个预算，必须先落进任务日志
+        task.log(f"{STAGE_LABELS[stage]}超时预算：{timeout} 秒（{_TIMEOUT_ENV}{stage.upper()} 可调）")
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -402,7 +492,16 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
 
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            # 独立进程组：取消时才能整组终止（taskkill /T 也依赖它）
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        # POSIX 必须自己开新会话：否则子进程留在服务器自己的进程组里，
+        # tasks.kill_process_tree 的 killpg(getpgid(child)) 会把 webapp/CLI
+        # （连同 pytest）一起 SIGKILL。
+        kwargs["start_new_session"] = True
     process = subprocess.Popen(
         command,
         cwd=str(ctx.root),
@@ -419,11 +518,33 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
     task.attach_process(process)
     tables_total = len(table_pages(ctx))
     recent_output: list[str] = []
+    lines: "queue.Queue[Any]" = queue.Queue()
+    deadline = time.monotonic() + timeout if timeout else None
+    code: int | None = None
     try:
         assert process.stdout is not None
-        for raw_line in process.stdout:
+        threading.Thread(
+            target=_pump_stdout,
+            args=(process.stdout, lines),
+            name=f"pipeline-{stage}-stdout",
+            daemon=True,
+        ).start()
+        while True:
             if task.cancelled:
                 raise TaskCancelled()
+            wait = 1.0
+            if deadline is not None:
+                wait = max(0.02, min(1.0, deadline - time.monotonic()))
+            try:
+                raw_line = lines.get(timeout=wait)
+            except queue.Empty:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"{STAGE_LABELS[stage]}超时（>{timeout}s），已终止进程树"
+                    )
+                continue
+            if raw_line is _EOF:
+                break
             line = raw_line.rstrip()
             if line:
                 task.log(line)
@@ -438,15 +559,18 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
                 task.progress(done, total, message)
         code = process.wait()
     finally:
-        if process.stdout is not None:
+        # 取消 / 超时 / 异常时子进程可能仍在跑（也可能父进程退了孙进程还活着）
+        if code is None or process.poll() is None:
+            kill_process_tree(process)
+            _reap(process)
+        # 只在正常读到 EOF（code 已赋值）时由主线程关流：此时读线程已经退出。
+        # 取消/超时路径上读线程可能仍阻塞在 read 上并持锁，主线程 close() 会永久
+        # 挂住 run_stage（进而永不释放 book_lock、前端永久 409）；让 daemon 读线程
+        # 自己收尾，进程对象销毁时管道随之释放。
+        if code is not None and process.stdout is not None:
             try:
                 process.stdout.close()
-            except OSError:
-                pass
-        if process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
+            except (OSError, ValueError):
                 pass
     if task.cancelled:
         raise TaskCancelled()

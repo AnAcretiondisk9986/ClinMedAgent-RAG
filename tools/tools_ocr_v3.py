@@ -19,6 +19,8 @@ import sys
 import time
 from pathlib import Path
 
+from tools_common import atomic_write_text, load_page_json, valid_page_json
+
 # --- 让 onnxruntime 找到 pip 安装的 CUDA/cuDNN DLL（必须在 import 之前） ---------
 def _register_cuda_dlls() -> list[str]:
     nv = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
@@ -148,13 +150,14 @@ def main() -> None:
         todo = [
             n
             for n in wanted
-            if 1 <= n <= total and (args.reset or not (boxes_dir / f"page-{n:04d}.json").exists())
+            # 判据是“内容完整”而不是“文件存在”：半截 JSON 必须重做
+            if 1 <= n <= total and (args.reset or not valid_page_json(boxes_dir / f"page-{n:04d}.json", n))
         ]
     else:
         todo = [
             n
             for n in range(args.start, end + 1)
-            if args.reset or not (boxes_dir / f"page-{n:04d}.json").exists()
+            if args.reset or not valid_page_json(boxes_dir / f"page-{n:04d}.json", n)
         ]
     print(
         f"引擎: PP-OCR{args.version[-1]} {args.model} | {'CPU' if args.cpu else 'CUDA(可能回退)'} | "
@@ -166,11 +169,15 @@ def main() -> None:
     for i, n in enumerate(todo, 1):
         t0 = time.time()
         payload = ocr_page(engine, str(args.pdf), n, args.dpi)
-        (boxes_dir / f"page-{n:04d}.json").write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        atomic_write_text(
+            boxes_dir / f"page-{n:04d}.json",
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
         )
-        (pages_dir / f"page-{n:04d}.md").write_text(
-            f"# 第 {n} 页\n\n" + "\n".join(payload["lines"]) + "\n", encoding="utf-8"
+        atomic_write_text(
+            pages_dir / f"page-{n:04d}.md",
+            f"# 第 {n} 页\n\n" + "\n".join(payload["lines"]) + "\n",
+            encoding="utf-8",
         )
         print(
             f"{i}/{len(todo)} 第{n}页  {time.time() - t0:.1f}s  "
@@ -181,11 +188,22 @@ def main() -> None:
 
     manifest = []
     book_parts = []
+    corrupt_pages: list[int] = []
     for n in range(1, total + 1):
         box_file = boxes_dir / f"page-{n:04d}.json"
         if not box_file.exists():
             continue
-        payload = json.loads(box_file.read_text(encoding="utf-8"))
+        # 单页产物损坏不能让整本书的汇总崩掉：跳过并明确记账，用户用 --pages 重跑
+        payload = load_page_json(box_file, n)
+        if payload is None:
+            corrupt_pages.append(n)
+            print(
+                f"[警告] 跳过损坏的 boxes/page-{n:04d}.json（JSON 不可解析或页号不符）；"
+                f"用 --pages {n} 重跑该页",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         manifest.append(
             {
                 "page": n,
@@ -196,21 +214,26 @@ def main() -> None:
             }
         )
         book_parts.append(f"## 第 {n} 页\n\n" + "\n".join(payload["lines"]))
-    (args.out / "manifest.json").write_text(
+    atomic_write_text(
+        args.out / "manifest.json",
         json.dumps(
             {
                 "source": str(args.pdf.resolve()),
                 "engine": f"rapidocr 3.x PP-OCR{args.version[-1]} {args.model}",
                 "cuda": not args.cpu,
                 "pages": manifest,
+                # 坏页在这里留痕，避免“少了几页但没人知道”
+                "corrupt_pages": corrupt_pages,
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
-    (args.out / "book.md").write_text(
-        "# 系统解剖学 第5版（OCR v3）\n\n" + "\n\n".join(book_parts) + "\n", encoding="utf-8"
+    atomic_write_text(
+        args.out / "book.md",
+        "# 系统解剖学 第5版（OCR v3）\n\n" + "\n\n".join(book_parts) + "\n",
+        encoding="utf-8",
     )
     print(f"完成：{args.out}", file=sys.stderr)
 

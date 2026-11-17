@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
+import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -765,6 +769,352 @@ class TextLayerWorkflowTests(WebAppTestCase):
 
         _, payload = self.json_data(f"/api/books/{book['id']}/text/1")
         self.assertTrue(payload["data"]["chunks"])
+
+
+class HostGuardTests(WebAppTestCase):
+    """Host 头只认本机/绑定地址：挡住 DNS rebinding（恶意域名解析到 127.0.0.1）。"""
+
+    def test_forged_host_header_is_rejected(self) -> None:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(b"GET /api/books HTTP/1.1\r\nHost: evil.example.com\r\n\r\n")
+            response = sock.recv(8192).decode("utf-8", "replace")
+        self.assertIn("403", response.split("\r\n")[0])
+
+    def test_loopback_host_header_is_accepted(self) -> None:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(
+                f"GET /api/books HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode("ascii")
+            )
+            response = sock.recv(8192).decode("utf-8", "replace")
+        self.assertIn("200", response.split("\r\n")[0])
+
+
+class CrossSiteGuardTests(WebAppTestCase):
+    """变更类接口：有 Origin 时必须同源，且只接受 application/json。
+
+    注意宽松点：curl / 现有测试不带 Origin，必须照旧放行。
+    """
+
+    def test_no_origin_curl_style_post_still_works(self) -> None:
+        status, payload = self.json_data("/api/search", "POST", {"query": "骨骼肌"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+
+    def test_cross_origin_post_is_rejected(self) -> None:
+        status, _, body = self.request(
+            "/api/search",
+            "POST",
+            payload={"query": "骨骼肌"},
+            headers={"Origin": "https://evil.example"},
+        )
+        self.assertEqual(status, 403, body)
+        self.assertIn("跨站", json.loads(body)["error"])
+
+    def test_sec_fetch_cross_site_post_is_rejected(self) -> None:
+        status, _, body = self.request(
+            "/api/search",
+            "POST",
+            payload={"query": "骨骼肌"},
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(status, 403, body)
+
+    def test_same_origin_post_is_accepted(self) -> None:
+        status, _, body = self.request(
+            "/api/search",
+            "POST",
+            payload={"query": "骨骼肌"},
+            headers={"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 200, body)
+
+    def test_text_plain_post_is_rejected(self) -> None:
+        """text/plain 属 CORS 简单请求，浏览器不发预检，必须靠 Content-Type 挡。"""
+        status, _, body = self.request(
+            "/api/search",
+            "POST",
+            raw=json.dumps({"query": "骨骼肌"}).encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+        self.assertEqual(status, 415, body)
+
+
+class PayloadStatusTests(WebAppTestCase):
+    """客户端错误要可区分：超限 413、坏 JSON / 坏数值 400，不能一律 500。"""
+
+    def test_oversized_json_body_is_413(self) -> None:
+        with mock.patch.object(webapp_module, "MAX_JSON_BODY", 8):
+            status, _, body = self.request("/api/search", "POST", payload={"query": "骨骼肌"})
+        self.assertEqual(status, 413, body)
+        self.assertIn("请求体过大", json.loads(body)["error"])
+
+    def test_malformed_json_is_400(self) -> None:
+        status, _, body = self.request(
+            "/api/search", "POST", raw=b"{not json", headers={"Content-Type": "application/json"}
+        )
+        self.assertEqual(status, 400, body)
+
+    def test_non_object_json_is_400(self) -> None:
+        status, _, body = self.request(
+            "/api/search", "POST", raw=b"[1,2]", headers={"Content-Type": "application/json"}
+        )
+        self.assertEqual(status, 400, body)
+
+    def test_non_numeric_limit_falls_back_to_default(self) -> None:
+        """{"limit":"abc"} 不能变成 500：回落默认值，照常检索。"""
+        self.index_book(page=1, text="骨骼肌由肌腹和肌腱构成。")
+        status, payload = self.json_data("/api/search", "POST", {"query": "骨骼肌", "limit": "abc"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["results"])
+
+
+class NonAsciiTokenTests(unittest.TestCase):
+    """中文口令：hmac.compare_digest 的 str 版只接受 ASCII，必须编码成 bytes 再比较。"""
+
+    TOKEN = "教材口令"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="medrag_auth_cn_"))
+        self.server = create_server("127.0.0.1", 0, root=self.tmp, token=self.TOKEN)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def request(self, path: str, headers=None):
+        request = urllib.request.Request(self.base + path, method="GET", headers=dict(headers or {}))
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code
+            finally:
+                error.close()
+
+    def test_query_token_with_chinese_is_accepted(self) -> None:
+        quoted = urllib.parse.quote(self.TOKEN)
+        self.assertEqual(self.request(f"/api/books?token={quoted}"), 200)
+
+    def test_cookie_token_with_chinese_is_accepted(self) -> None:
+        quoted = urllib.parse.quote(self.TOKEN)
+        self.assertEqual(
+            self.request("/api/overview", headers={"Cookie": f"medrag_token={quoted}"}), 200
+        )
+
+    def test_missing_or_wrong_chinese_token_is_401(self) -> None:
+        self.assertEqual(self.request("/api/books"), 401)
+        wrong = urllib.parse.quote("教材口令错")
+        self.assertEqual(self.request(f"/api/books?token={wrong}"), 401)
+
+
+class PreviewCacheTests(WebAppTestCase):
+    """预览图宽度必须量化到 900/1200/1600/2000/2600 五档，缓存按 mtime 淘汰。"""
+
+    def test_width_is_quantised_to_bucket(self) -> None:
+        book_id = self.book_id()
+        for width in (1100, 1150, 1200):
+            status, headers, body = self.request(f"/api/books/{book_id}/page/2.png?w={width}")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "image/png")
+            self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
+        cache = self.tmp / ".medical_rag" / "web_cache"
+        self.assertEqual(
+            [path.name for path in cache.rglob("page-0002-*.png")],
+            ["page-0002-w1200.png"],
+        )
+
+    def test_bucket_width_is_monotonic(self) -> None:
+        self.assertEqual(webapp_module.RENDER_WIDTH_BUCKETS, (900, 1200, 1600, 2000, 2600))
+        self.assertEqual(webapp_module.bucket_width(1), 900)
+        self.assertEqual(webapp_module.bucket_width(900), 900)
+        self.assertEqual(webapp_module.bucket_width(901), 1200)
+        self.assertEqual(webapp_module.bucket_width(1201), 1600)
+        self.assertEqual(webapp_module.bucket_width(99999), 2600)
+        self.assertEqual(webapp_module.bucket_width("bad"), 900)
+
+    def test_prune_cache_drops_oldest_until_under_limit(self) -> None:
+        cache = self.tmp / ".medical_rag" / "web_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for index in range(4):
+            path = cache / f"fake-{index}.png"
+            path.write_bytes(b"x" * 1000)
+            os.utime(path, (1000 + index, 1000 + index))
+            paths.append(path)
+        removed = webapp_module._prune_cache(self.server.app, limit_bytes=2500)
+        self.assertEqual(removed, 2)
+        self.assertFalse(paths[0].exists())
+        self.assertTrue(paths[-1].exists())
+        self.assertLessEqual(sum(path.stat().st_size for path in paths if path.exists()), 2500)
+
+
+class ResidentLibraryTests(WebAppTestCase):
+    """常驻 Library：同一条 keep-alive 连接上的请求不能每次重新开关库。"""
+
+    def test_library_is_reused_within_thread(self) -> None:
+        app = self.server.app
+        first = app.library()
+        self.assertIs(first, app.library())
+        app.invalidate_library()
+        second = app.library()
+        self.assertIsNot(first, second)
+        app.close_libraries()
+
+    def test_connection_close_releases_thread_library(self) -> None:
+        """Connection: close 的客户端每次请求换线程：连接结束必须回收常驻连接。"""
+        self.index_book(page=1)
+        book_id = self.book_id()
+        app = self.server.app
+        before = len(list(app._libraries))
+        self.request(f"/api/books/{book_id}/text/1")
+        deadline = time.time() + 5.0
+        while time.time() < deadline and len(list(app._libraries)) > before:
+            time.sleep(0.02)  # 服务端 finish() 与客户端读到响应之间有一小段竞态
+        self.assertEqual(len(list(app._libraries)), before, "连接关闭后不应残留常驻连接")
+
+    def test_close_libraries_is_honest_about_cross_thread_connections(self) -> None:
+        """F3：sqlite 连接只能由 owner 线程关闭，跨线程收尾必须干账而不是静默吞错。
+
+        以前 ``close_libraries()`` 用 ``except Exception: pass`` 把
+        ``ProgrammingError`` 吞掉：``_libraries`` 账清零了、连接还活着，收尾看起来
+        成功其实没有。现在别的线程的连接只登记 ``request_close()``，由 owner 线程在
+        下一次使用时真正关闭；失败一律记进 ``_close_errors``。
+        """
+        app = self.server.app
+        holder: dict[str, Library] = {}
+        observed: dict[str, object] = {}
+        ready = threading.Event()
+        go = threading.Event()
+
+        def worker() -> None:
+            library = app.library()  # owner 线程 = 本线程
+            holder["library"] = library
+            ready.set()
+            go.wait(timeout=10)
+            try:
+                library.search("上皮组织", 1)
+            except Exception as exc:  # noqa: BLE001 - 关库后必须明确失败
+                observed["search_error"] = exc
+            else:
+                observed["search_error"] = None
+            try:
+                library.cx.execute("SELECT 1")
+            except sqlite3.ProgrammingError as exc:
+                observed["cx_error"] = exc
+            else:
+                observed["cx_error"] = None
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=10), "owner 线程没建起常驻连接")
+        foreign = holder["library"]
+        self.assertEqual(foreign.owner_thread, thread.ident)
+        self.assertIn(foreign, list(app._libraries))
+
+        app.close_libraries()  # 主线程收尾：不能真的关别的线程的连接
+
+        self.assertEqual(list(app._libraries), [], "账本应清零")
+        self.assertIn(foreign, list(app._pending_close), "跨线程连接必须登记待关，不能当没发生")
+        self.assertEqual(app._close_errors, [], "不该产生静默吞掉的关闭失败")
+
+        go.set()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        error = observed.get("search_error")
+        self.assertIsNotNone(error, "关库后 owner 线程里 search 竟然还成功")
+        self.assertIn("closed", str(error).lower())
+        self.assertIsInstance(observed.get("cx_error"), sqlite3.ProgrammingError)
+
+        # 真正的关闭在 owner 线程里发生了：再收一次账，待关清单必须收敛到空
+        app.close_libraries()
+        self.assertEqual(list(app._pending_close), [], "owner 关闭后待关账目应收敛")
+        self.assertEqual(app._close_errors, [])
+
+    def test_cross_thread_close_is_recorded_not_swallowed(self) -> None:
+        """``_close_library`` 在非 owner 线程里失败时必须记账，再交给 owner 线程真关。"""
+        app = self.server.app
+        holder: dict[str, Library] = {}
+        ready = threading.Event()
+        release = threading.Event()
+
+        def worker() -> None:
+            holder["library"] = app.library()
+            ready.set()
+            release.wait(timeout=10)
+            app.release_thread_library()  # owner 线程的正常收尾路径
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=10), "owner 线程没建起常驻连接")
+        foreign = holder["library"]
+
+        app._close_library(foreign)  # 故意在错误线程收尾
+        self.assertEqual(len(app._close_errors), 1, "跨线程关闭失败被静默吞掉了")
+        self.assertIn("ProgrammingError", app._close_errors[0])
+        self.assertIn(foreign, list(app._pending_close))
+        self.assertFalse(foreign.closed)
+
+        release.set()
+        thread.join(timeout=10)
+        self.assertTrue(foreign.closed, "owner 线程收尾时应真正关闭连接")
+        self.assertNotIn(foreign, list(app._pending_close))
+        self.assertNotIn(foreign, list(app._libraries))
+
+    def test_keepalive_request_is_not_blocked_by_writer(self) -> None:
+        """另一条连接持写事务时，预览文本仍要立刻 200（不是 busy_timeout 30s 后 500）。"""
+        self.index_book(page=1)
+        book_id = self.book_id()
+        db = self.tmp / ".medical_rag" / "library.sqlite3"
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/api/books")
+        first = conn.getresponse()
+        first.read()  # 读完才能复用这条 keep-alive 连接
+        self.assertEqual(first.status, 200)  # 先把常驻连接建起来
+        writer = sqlite3.connect(db, timeout=1.0)
+        writer.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            conn.request("GET", f"/api/books/{book_id}/text/1")
+            response = conn.getresponse()
+            body = response.read()
+            elapsed = time.monotonic() - started
+        finally:
+            writer.rollback()
+            writer.close()
+        self.assertEqual(response.status, 200, body)
+        self.assertLess(elapsed, 5.0)
+        self.assertTrue(json.loads(body)["data"]["indexed"])
+
+
+class PdfRangeSuffixTests(WebAppTestCase):
+    """Range 后缀形式 bytes=-N（PDF 阅读器读尾页/尾部交叉引用表要用）。"""
+
+    def test_suffix_range_returns_tail_bytes(self) -> None:
+        book_id = self.book_id()
+        size = self.pdf.stat().st_size
+        status, headers, body = self.request(
+            f"/api/books/{book_id}/pdf", headers={"Range": "bytes=-100"}
+        )
+        self.assertEqual(status, 206)
+        self.assertEqual(len(body), 100)
+        self.assertEqual(headers["Content-Range"], f"bytes {size - 100}-{size - 1}/{size}")
+
+    def test_invalid_suffix_and_start_ranges_are_416(self) -> None:
+        book_id = self.book_id()
+        for header in ("bytes=-0", "bytes=99999999-", "bytes=99999999-100000000"):
+            with self.subTest(header=header):
+                status, headers, _ = self.request(
+                    f"/api/books/{book_id}/pdf", headers={"Range": header}
+                )
+                self.assertEqual(status, 416)
+                size = self.pdf.stat().st_size
+                self.assertEqual(headers.get("Content-Range"), f"bytes */{size}")
 
 
 if __name__ == "__main__":

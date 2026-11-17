@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -416,6 +417,228 @@ class StructureStaleCleanupTests(unittest.TestCase):
         self.assertEqual(list(out.glob(".staging-*")), [])
         self.assertEqual(list(out.glob(".backup-*")), [])
         self.assertTrue((out / "quality.json").exists())
+
+
+class StageTimeoutTests(unittest.TestCase):
+    """零超时 + 读循环只认行 → 子进程静默挂起时任务永久 running、这本书永久锁死。"""
+
+    def test_silent_stage_times_out_instead_of_hanging(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_timeout_"))
+        context = make_context(tmp)
+        make_pdf(context.pdf)
+        started = time.time()
+
+        class BlockingStdout:
+            """永远没有行、也没有 EOF：等价于孙进程一直握着 stdout 管道。"""
+
+            def __init__(self) -> None:
+                self._stop = threading.Event()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self._stop.wait(5)
+                raise StopIteration
+
+            def close(self) -> None:
+                self._stop.set()
+
+        class SilentProcess:
+            def __init__(self) -> None:
+                self.stdout = BlockingStdout()
+                self.killed = 0
+                self._code: int | None = None
+
+            def poll(self):
+                return self._code
+
+            def wait(self, timeout=None):
+                if self._code is None:
+                    self._code = 0
+                return self._code
+
+            def kill(self):
+                self.killed += 1
+                self._code = -9
+
+        process = SilentProcess()
+        task = TaskManager().create_manual("process", "静默阶段")
+        with mock.patch.object(pipeline, "_check_prerequisites"):
+            with mock.patch.object(pipeline, "stage_command", return_value=["fake-command"]):
+                with mock.patch.dict(pipeline.STAGE_TIMEOUTS, {"text": 1}):
+                    with mock.patch.object(pipeline.subprocess, "Popen", return_value=process):
+                        with self.assertRaises(RuntimeError) as ctx:
+                            pipeline.run_stage(task, context, "text")
+        self.assertIn("超时", str(ctx.exception))
+        self.assertLess(time.time() - started, 10)
+        self.assertEqual(process.killed, 1)  # finally 里必须真的终止并回收
+
+    def test_stage_timeout_budget_prefers_env_override(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_timeout_env_"))
+        context = make_context(tmp)
+        self.assertEqual(pipeline._stage_timeout(context, "layout"), 1200)
+        with mock.patch.dict(os.environ, {"MEDICAL_RAG_STAGE_TIMEOUT_LAYOUT": "7"}):
+            self.assertEqual(pipeline._stage_timeout(context, "layout"), 7)
+        with mock.patch.dict(os.environ, {"MEDICAL_RAG_STAGE_TIMEOUT_LAYOUT": "0"}):
+            self.assertIsNone(pipeline._stage_timeout(context, "layout"))  # 0 = 不限时
+
+
+class CancelKillTests(unittest.TestCase):
+    def test_cancel_kills_running_process(self) -> None:
+        """进程还活着时，取消要立刻穿透（不必等下一个 1s 轮询）。"""
+
+        class RunningProcess:
+            def __init__(self) -> None:
+                self.killed = 0
+
+            def poll(self):
+                return None  # 还在跑
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self) -> None:
+                self.killed += 1
+
+        process = RunningProcess()
+        task = TaskManager().create_manual("process", "取消")
+        task.attach_process(process)
+        task.cancel()
+        self.assertEqual(process.killed, 1)
+
+    def test_cancel_does_not_kill_already_exited_process(self) -> None:
+        """父进程已退出时不要再按旧 PID 杀树。
+
+        ``Task._process`` 会一直留到 ``_run`` 的 finally，阶段切换的空窗里它指向
+        的是**上一个已退出的**子进程；Windows 的 PID 会被复用，此时
+        ``taskkill /T /F`` 可能打到无关进程上。「父进程已退、孙进程还握管道」
+        那种情况由 ``run_stage`` 的 finally 处理（它手里有真实 pid，且
+        ``StageTimeoutTests`` 覆盖）。
+        """
+
+        class ExitedProcess:
+            def __init__(self) -> None:
+                self.killed = 0
+
+            def poll(self):
+                return 0  # 父进程已退出
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self) -> None:
+                self.killed += 1
+
+        process = ExitedProcess()
+        task = TaskManager().create_manual("process", "取消")
+        task.attach_process(process)
+        task.cancel()
+        self.assertEqual(process.killed, 0)
+
+
+class RenderCacheKeyTests(unittest.TestCase):
+    def test_cache_dir_changes_when_pdf_changes(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_cachekey_"))
+        context = make_context(tmp)
+        make_pdf(context.pdf, pages=2)
+        layout_first = pipeline.stage_command(context, "layout")
+        tables = pipeline.stage_command(context, "tables")
+        cache_first = layout_first[layout_first.index("--cache") + 1]
+        self.assertIn("render300_", tables[tables.index("--cache") + 1])
+        # 同路径换一版 PDF：缓存目录必须跟着变，否则旧页图被当新书证据
+        make_pdf(context.pdf, pages=3)
+        os.utime(context.pdf, (time.time() - 100, time.time() - 100))
+        layout_second = pipeline.stage_command(context, "layout")
+        self.assertNotEqual(cache_first, layout_second[layout_second.index("--cache") + 1])
+
+
+class ToolsCommonTests(unittest.TestCase):
+    """tools/ 产物原子写 + 续跑校验（半截 JSON 必须被识别为坏页）。"""
+
+    def test_atomic_write_keeps_old_content_on_failure(self) -> None:
+        import tools_common
+
+        target = Path(tempfile.mkdtemp(prefix="medrag_atomic_")) / "page-0001.json"
+        target.write_text('{"page": 1, "boxes": []}', encoding="utf-8")
+        tools_common.atomic_write_text(target, '{"page": 1, "boxes": [{"text": "骨"}]}')
+        self.assertEqual(len(json.loads(target.read_text(encoding="utf-8"))["boxes"]), 1)
+        with mock.patch.object(tools_common.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                tools_common.atomic_write_text(target, '{"page": 1, "boxes": [')
+        # 失败时旧内容完好，且不留临时文件
+        self.assertEqual(len(json.loads(target.read_text(encoding="utf-8"))["boxes"]), 1)
+        self.assertEqual(list(target.parent.glob("*.tmp-*")), [])
+
+    def test_valid_page_json_rejects_truncated_and_wrong_page(self) -> None:
+        import tools_common
+
+        box_dir = Path(tempfile.mkdtemp(prefix="medrag_page_"))
+        good = box_dir / "page-0001.json"
+        good.write_text(json.dumps({"page": 1, "boxes": [{"text": "骨"}]}), encoding="utf-8")
+        self.assertTrue(tools_common.valid_page_json(good, 1))
+        self.assertFalse(tools_common.valid_page_json(good, 2))  # 页号不符
+        truncated = box_dir / "page-0002.json"
+        truncated.write_text('{"page": 2, "boxes": [{"text": "骨', encoding="utf-8")
+        self.assertFalse(tools_common.valid_page_json(truncated, 2))
+
+    def test_cached_render_invalidates_when_pdf_content_changes(self) -> None:
+        """修复前只判 ``out.exists()``：换一版 PDF 会拿到字节相同的旧页图。"""
+        import hashlib
+
+        import tools_common
+
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_render_"))
+        pdf = tmp / "book.pdf"
+        cache = tmp / "cache"
+        make_pdf(pdf, pages=1)
+        first, _, _ = tools_common.cached_render(pdf, 1, 72, cache)
+        digest_first = hashlib.sha256(first.read_bytes()).hexdigest()
+
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 400), "完全不同的一页", fontsize=40)
+        doc.save(str(pdf))
+        doc.close()
+        os.utime(pdf, (time.time() - 500, time.time() - 500))
+
+        second, _, _ = tools_common.cached_render(pdf, 1, 72, cache)
+        self.assertNotEqual(digest_first, hashlib.sha256(second.read_bytes()).hexdigest())
+        # 同一版 PDF 再来一次：命中缓存，字节不变
+        third, _, _ = tools_common.cached_render(pdf, 1, 72, cache)
+        self.assertEqual(hashlib.sha256(third.read_bytes()).hexdigest(), hashlib.sha256(second.read_bytes()).hexdigest())
+
+
+class OcrResumeTests(unittest.TestCase):
+    """坏页既要在续跑时重做，也不能让 manifest 汇总崩掉。"""
+
+    def test_corrupt_page_is_skipped_with_warning(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_ocr_"))
+        book = tmp / "text_v3"
+        boxes = book / "boxes"
+        boxes.mkdir(parents=True)
+        pdf = tmp / "book.pdf"
+        make_pdf(pdf, pages=2)
+        (boxes / "page-0001.json").write_text(
+            json.dumps({"page": 1, "boxes": [], "lines": ["正文"], "avg_confidence": 0.9}),
+            encoding="utf-8",
+        )
+        # 模拟写入瞬间被 kill：文件存在但内容截断
+        (boxes / "page-0002.json").write_text('{"page": 2, "boxes": [', encoding="utf-8")
+
+        sys.modules.pop("tools_ocr_v3", None)
+        with mock.patch.dict(sys.modules, {"rapidocr": mock.MagicMock()}):
+            import tools_ocr_v3
+
+            argv = ["tools_ocr_v3.py", str(pdf), str(book), "--pages", "1"]
+            stderr = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(stderr):
+                tools_ocr_v3.main()
+
+        self.assertIn("跳过损坏", stderr.getvalue())
+        manifest = json.loads((book / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["page"] for item in manifest["pages"]], [1])
+        self.assertEqual(manifest["corrupt_pages"], [2])
 
 
 if __name__ == "__main__":

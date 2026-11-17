@@ -25,6 +25,8 @@ import sys
 import time
 from pathlib import Path
 
+from tools_common import atomic_write_text, cached_render
+
 
 def register_cuda_dlls() -> None:
     nv = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
@@ -48,20 +50,8 @@ OCR_MODELS = {
 
 
 def render(pdf_path: str, page_number: int, dpi: int, cache_dir: Path):
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / f"page-{page_number:04d}.png"
-    import fitz
-
-    if not out.exists():
-        with fitz.open(pdf_path) as doc:
-            page = doc[page_number - 1]
-            scale = dpi / 72
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
-            pix.save(str(out))
-    from PIL import Image
-
-    with Image.open(out) as im:
-        return out, im.width, im.height
+    """渲染（或复用）页图；缓存键带 PDF size/mtime，换一版 PDF 不会复用旧图。"""
+    return cached_render(pdf_path, page_number, dpi, cache_dir)
 
 
 def gpu_mem() -> str:
@@ -144,14 +134,17 @@ def main() -> None:
             print(f"  第{n}页 表{i}: {x1 - x0}x{y1 - y0}px  {dt:.1f}s  显存 {gpu_mem()}", flush=True)
         page_img.close()
         md = "\n\n".join(f"[表格]\n{html}" for html in htmls)
-        (tables_dir / f"page-{n:04d}.md").write_text(md, encoding="utf-8")
-        (tables_dir / f"page-{n:04d}.json").write_text(
-            json.dumps({"page": n, "tables": htmls}, ensure_ascii=False), encoding="utf-8"
+        atomic_write_text(tables_dir / f"page-{n:04d}.md", md, encoding="utf-8")
+        atomic_write_text(
+            tables_dir / f"page-{n:04d}.json",
+            json.dumps({"page": n, "tables": htmls}, ensure_ascii=False),
+            encoding="utf-8",
         )
         report.append({"page": n, "tables": len(htmls), "seconds": round(time.time() - t_page, 1)})
         print(f"[第{n}页] {time.time() - t_page:.1f}s  {len(htmls)} 个表格", flush=True)
 
-    (args.out / "tables_gpu_report.json").write_text(
+    atomic_write_text(
+        args.out / "tables_gpu_report.json",
         json.dumps({"ocr": args.ocr, "device": args.device, "pages": report}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

@@ -13,7 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
+
+from tools_common import atomic_write_text, load_page_json
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TARGET = ROOT / "res" / "系统解剖学" / "text_v3"
@@ -66,12 +69,24 @@ def main() -> None:
                 for k, v in hits.items():
                     total[k] = total.get(k, 0) + v
                 if not args.dry_run:
-                    f.write_text(fixed, encoding="utf-8")
+                    atomic_write_text(f, fixed, encoding="utf-8")
 
     boxes = args.target / "boxes"
     if boxes.exists():
         for f in sorted(boxes.glob("*.json")):
-            payload = json.loads(f.read_text(encoding="utf-8"))
+            try:
+                page_no = int(f.stem.split("-")[-1])
+            except ValueError:
+                page_no = None
+            # 半截 JSON 直接读会在这里崩掉，且下次重跑还是崩：跳过并明确记账
+            payload = load_page_json(f, page_no)
+            if payload is None:
+                print(
+                    f"[警告] 跳过损坏的 boxes/{f.name}（JSON 不可解析或页号不符）",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             changed = False
             for b in payload.get("boxes", []):
                 new, hits = fix_text(b.get("text", ""))
@@ -85,7 +100,7 @@ def main() -> None:
                     payload["lines"][i] = fix_text(line)[0]
                 files_changed += 1
                 if not args.dry_run:
-                    f.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                    atomic_write_text(f, json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     print(f"{'[dry-run] ' if args.dry_run else ''}修改文件数: {files_changed}")
     print("替换统计:", dict(sorted(total.items(), key=lambda x: -x[1])))

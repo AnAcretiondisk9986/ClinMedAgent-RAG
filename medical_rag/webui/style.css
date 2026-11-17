@@ -368,7 +368,6 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
   padding: 4px 14px; border-radius: 999px; font-size: 12px;
 }
 .page-text {
-  width: 360px; flex: none;
   min-height: 0;
   border-left: 1px solid var(--border);
   padding: 12px 14px;
@@ -545,7 +544,6 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 /* 21:9 超宽屏：侧栏与文本栏略收窄，版面更集中 */
 @media (min-aspect-ratio: 21/9) {
   .sidebar { width: 280px; }
-  .page-text { width: 340px; }
 }
 
 /* 16:10 / 1080p 等屏高偏低时继续压缩头部 */
@@ -560,7 +558,7 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
   .detail-meta h2 { font-size: 18px; }
   .status-chip { padding: 4px 9px; font-size: 11.5px; }
   .actions .btn { padding: 5px 11px; font-size: 13px; }
-  .page-text { width: 320px; padding: 10px 12px; }
+  .page-text { padding: 10px 12px; }
 }
 
 @media (max-height: 720px) {
@@ -581,7 +579,7 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
   .preview-body { display: block; }
   .page-stage { min-height: 55vh; }
   .page-stage img { max-height: none; }
-  .page-text { width: auto; border-left: none; border-top: 1px solid var(--border); }
+  .page-text { border-left: none; border-top: 1px solid var(--border); }
   .detail-head { flex-direction: column; }
 }
 /* MedShelf responsive workspace */
@@ -635,7 +633,7 @@ html,body{font-family:"Aptos","SF Pro Display","Segoe UI Variable","Noto Sans SC
 /* Rounded reading controls and silent scrollbars: scrolling remains available. */
 html,body,*{scrollbar-width:none}html::-webkit-scrollbar,body::-webkit-scrollbar,*::-webkit-scrollbar{display:none;width:0;height:0}.page-slider-wrap{display:flex;align-items:center;gap:8px;min-width:180px;flex:1;max-width:360px;color:var(--muted);font-size:10px;white-space:nowrap}.page-slider{appearance:none;width:100%;height:6px;padding:0;border:0;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent-soft));cursor:pointer}.page-slider::-webkit-slider-thumb{appearance:none;width:17px;height:17px;border:3px solid var(--accent);border-radius:50%;background:var(--panel);box-shadow:0 2px 7px rgba(20,70,150,.25)}.page-slider::-moz-range-thumb{width:12px;height:12px;border:3px solid var(--accent);border-radius:50%;background:var(--panel)}.page-slider:focus-visible{outline:3px solid var(--accent-soft);outline-offset:5px}.preview-toolbar button,.btn,.tab,.nav-item,.book-card,.dashboard-book,.status-chip,.dropzone,.modal-box,.task-panel,.preview,input,select{border-radius:16px!important}.preview-toolbar .btn{border-radius:999px!important}.detail{background:linear-gradient(135deg,var(--bg) 0%,color-mix(in srgb,var(--accent-soft) 30%,var(--bg)) 48%,var(--bg) 100%);border-radius:24px;padding:14px 24px 22px}.detail-head{background:linear-gradient(110deg,rgba(255,255,255,.72),rgba(220,233,255,.38));border:1px solid color-mix(in srgb,var(--accent) 22%,var(--border));border-radius:22px;padding:16px 18px;margin-bottom:12px;box-shadow:0 8px 24px rgba(35,87,170,.08)}@media(prefers-color-scheme:dark){.detail-head{background:linear-gradient(110deg,rgba(16,36,74,.88),rgba(28,66,124,.5))}}@media(max-width:760px){.detail{padding:8px 10px 14px;border-radius:18px}.page-slider-wrap{order:5;flex-basis:100%;max-width:none}.page-slider{height:7px}}
 /* Correct the highlighted detail workspace: gradient belongs to the full underlay; the book info card stays a readable white surface. */
-.detail{background:linear-gradient(135deg,#f9fcff 0%,#e8f1ff 42%,#d8e7fb 100%)!important;border-radius:24px!important;padding:14px 24px 22px!important}.detail-head{background:linear-gradient(135deg,rgba(255,255,255,.98),rgba(245,250,255,.98))!important;border:1px solid #bcd2f2!important;color:#10213f!important;border-radius:22px!important;box-shadow:0 8px 24px rgba(35,87,170,.10)!important}.detail-head h2,.detail-head .muted,.detail-head .hint{color:#10213f!important}.detail-head .muted,.detail-head .hint{color:#4a6388!important}.preview{background:#fff!important;border-color:#bcd2f2!important;box-shadow:0 10px 28px rgba(35,87,170,.13)!important}.preview-toolbar{background:rgba(255,255,255,.94)!important}.page-stage{background:linear-gradient(145deg,#dbe9fb,#edf5ff)!important}.text-panel{background:#fff!important}.text-panel-head h3,.text-panel-head .eyebrow{color:#0b3da8!important}
+html:not([data-theme="dark"]) .detail{background:linear-gradient(135deg,#f9fcff 0%,#e8f1ff 42%,#d8e7fb 100%)!important;border-radius:24px!important;padding:14px 24px 22px!important}html:not([data-theme="dark"]) .detail-head{background:linear-gradient(135deg,rgba(255,255,255,.98),rgba(245,250,255,.98))!important;border:1px solid #bcd2f2!important;color:#10213f!important;border-radius:22px!important;box-shadow:0 8px 24px rgba(35,87,170,.10)!important}html:not([data-theme="dark"]) .detail-head h2,html:not([data-theme="dark"]) .detail-head .muted,html:not([data-theme="dark"]) .detail-head .hint{color:#10213f!important}html:not([data-theme="dark"]) .detail-head .muted,html:not([data-theme="dark"]) .detail-head .hint{color:#4a6388!important}html:not([data-theme="dark"]) .preview{background:#fff!important;border-color:#bcd2f2!important;box-shadow:0 10px 28px rgba(35,87,170,.13)!important}html:not([data-theme="dark"]) .preview-toolbar{background:rgba(255,255,255,.94)!important}html:not([data-theme="dark"]) .page-stage{background:linear-gradient(145deg,#dbe9fb,#edf5ff)!important}html:not([data-theme="dark"]) .text-panel{background:#fff!important}html:not([data-theme="dark"]) .text-panel-head h3,html:not([data-theme="dark"]) .text-panel-head .eyebrow{color:#0b3da8!important}
 @media(prefers-color-scheme:dark){html:not([data-theme="light"]) .detail{background:linear-gradient(135deg,#0a1730 0%,#102d5e 52%,#173f7d 100%)!important}html:not([data-theme="light"]) .detail-head{background:linear-gradient(135deg,#10244a,#17325f)!important;border-color:#36598d!important}html:not([data-theme="light"]) .detail-head h2{color:#f5f9ff!important}html:not([data-theme="light"]) .detail-head .muted,html:not([data-theme="light"]) .detail-head .hint{color:#c1d1eb!important}html:not([data-theme="light"]) .preview{background:#10244a!important;border-color:#36598d!important}html:not([data-theme="light"]) .preview-toolbar{background:#10244a!important}.preview:has(.text-panel) .text-panel{background:#10244a!important}}
 /* Light theme refinement: white canvas first, blue gradients only on focal accents. */
 html[data-theme="light"]{--bg:#fff;--panel:#fff;--panel-2:#f8fbff;--sidebar:#fff;--text:#14213d;--muted:#60708e;--border:#dce6f5;--accent:#145bea;--accent-strong:#083fae;--accent-soft:#eaf2ff;--glass:rgba(255,255,255,.97);--canvas:#f7faff;--shadow:0 8px 24px rgba(24,75,155,.09)}
@@ -643,3 +641,21 @@ html[data-theme="light"] body,html[data-theme="light"] .main{background:#fff;bac
 html[data-theme="light"] .detail{background:#fff!important;padding-top:14px!important}html[data-theme="light"] .detail-head{background:#fff!important;border-color:var(--border)!important;box-shadow:0 6px 18px rgba(24,75,155,.07)!important}html[data-theme="light"] .preview{background:#fff!important;border-color:var(--border)!important;box-shadow:0 8px 22px rgba(24,75,155,.08)!important}html[data-theme="light"] .preview-toolbar{background:#fff!important}html[data-theme="light"] .page-stage{background:linear-gradient(145deg,#f7fbff,#eaf3ff)!important}html[data-theme="light"] .text-panel{background:#fff!important}html[data-theme="light"] .dashboard-book{background:#fff!important;border-color:var(--border)}html[data-theme="light"] .dashboard-book:hover{background:linear-gradient(135deg,#fff,#eef6ff)!important}html[data-theme="light"] .capability-strip{background:#fff}html[data-theme="light"] .capability-strip article:first-child strong,html[data-theme="light"] .capability-strip article:first-child .capability-index{color:var(--accent-strong)}html[data-theme="light"] .btn.primary{background:linear-gradient(135deg,#1768f5,#0b48bd);border-color:#0b48bd;color:#fff;box-shadow:0 4px 12px rgba(20,91,234,.20)}html[data-theme="light"] .page-slider{background:linear-gradient(90deg,#b9d4ff,#1768f5,#b9d4ff)}html[data-theme="light"] .progress-bar{background:linear-gradient(90deg,#0b48bd,#65a4ff,#0b48bd)}html[data-theme="light"] .welcome-card:after{background:radial-gradient(circle,rgba(20,91,234,.16),transparent 68%)}
 /* Guarantee the transcript surface stays white in light mode, including when no explicit theme choice is stored. */
 html:not([data-theme="dark"]) .text-panel,html[data-theme="light"] .text-panel,html:not([data-theme="dark"]) .page-text,html[data-theme="light"] .page-text{background:#fff!important;color:#14213d!important;border-color:#dce6f5!important}html:not([data-theme="dark"]) .text-panel-head,html[data-theme="light"] .text-panel-head{background:#fff!important}html:not([data-theme="dark"]) .transcript-note,html[data-theme="light"] .transcript-note{background:#fff!important;color:#60708e!important;border-color:#dce6f5!important}html:not([data-theme="dark"]) .text-chunk .body,html[data-theme="light"] .text-chunk .body{color:#243b63!important}html:not([data-theme="dark"]) .text-chunk .section,html[data-theme="light"] .text-chunk .section{color:#0b3da8!important}
+/* 手动暗色（系统仍为亮色）时的详情与识别正文：补齐"白底白字"的另一半（暗色值取自上面的系统暗色块）。 */
+html[data-theme="dark"] .detail{background:linear-gradient(135deg,#0a1730 0%,#102d5e 52%,#173f7d 100%)!important}
+html[data-theme="dark"] .detail-head{background:linear-gradient(135deg,#10244a,#17325f)!important;border-color:#36598d!important;box-shadow:0 8px 24px rgba(0,0,0,.28)!important}
+html[data-theme="dark"] .detail-head h2{color:#f5f9ff!important}
+html[data-theme="dark"] .detail-head .muted,html[data-theme="dark"] .detail-head .hint{color:#c1d1eb!important}
+html[data-theme="dark"] .preview{background:#10244a!important;border-color:#36598d!important}
+html[data-theme="dark"] .preview-toolbar{background:#10244a!important;border-bottom-color:#36598d!important}
+html[data-theme="dark"] .page-stage{background:linear-gradient(145deg,#07132a,#0f2144)!important}
+html[data-theme="dark"] .text-panel{background:#10244a!important;border-color:#36598d!important}
+html[data-theme="dark"] .text-panel-head,html[data-theme="dark"] .transcript-note{background:#10244a!important;color:#c1d1eb!important;border-color:#36598d!important}
+html[data-theme="dark"] .text-panel-head h3,html[data-theme="dark"] .text-panel-head .eyebrow{color:#a9c8ff!important}
+html[data-theme="dark"] .page-text{background:#10244a!important;color:#f5f9ff!important;border-color:#36598d!important}
+html[data-theme="dark"] .text-chunk .body{color:#f5f9ff!important}
+html[data-theme="dark"] .text-chunk .section{color:#a9c8ff!important}
+html[data-theme="dark"] .text-chunk .citation{color:#c1d1eb!important}
+/* 识别文本栏宽度：正文宽度统一由 .text-panel 的 --text-width 决定（见上方 .text-panel 规则），
+   .page-text 不再写死 px，分隔条拖动才会真正改变正文宽度。 */
+.import-progress-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px}

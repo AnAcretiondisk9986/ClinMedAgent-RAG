@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -19,6 +22,35 @@ MAX_TASKS = 40
 
 class TaskCancelled(Exception):
     """任务被用户取消。"""
+
+
+def kill_process_tree(process: Any) -> None:
+    """终止子进程**及其派生的全部子进程**。
+
+    GPU 阶段（版面/表格）真正的算力在 paddle 派生出来的 worker 里：只
+    ``process.kill()`` 会留下握着显存的孤儿进程，下一次任务直接 OOM。Windows 用
+    ``taskkill /T``，POSIX 用进程组；拿不到 ``pid``（测试替身）时退回 ``kill()``。
+    """
+    pid = getattr(process, "pid", None)
+    if pid:
+        try:
+            if os.name == "nt":
+                done = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=15,
+                )
+                if done.returncode == 0:
+                    return
+            else:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                return
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    try:
+        process.kill()
+    except (OSError, AttributeError):
+        pass
 
 
 @dataclass
@@ -217,11 +249,12 @@ class Task:
         with self._lock:
             self._cancel.set()
             process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
+        # 必须先用 ``poll()`` 确认进程还活着：``_process`` 可能已经被上一阶段
+        # 退出，而 Windows 的 PID 会被复用，``taskkill /T /F`` 打到一个复用的
+        # PID 上会误杀无关进程。「父进程已退、孙进程还握管道」那种情况由
+        # run_stage 的 finally 处理（它手里有刚退出的 Popen 和真实 pid）。
+        if process is not None and getattr(process, "poll", lambda: 0)() is None:
+            kill_process_tree(process)
 
     @property
     def cancelled(self) -> bool:
@@ -234,11 +267,8 @@ class Task:
     def attach_process(self, process) -> None:
         with self._lock:
             self._process = process
-        if self._cancel.is_set() and process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
+        if self._cancel.is_set():
+            kill_process_tree(process)
 
     # ---------------------------------------------------------------- 快照
     def as_dict(self, include_logs_since: int | None = None) -> dict[str, Any]:

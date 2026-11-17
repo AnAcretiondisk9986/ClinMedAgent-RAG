@@ -149,6 +149,32 @@ class NgramIndexTests(unittest.TestCase):
         self.assertEqual(self._count("SELECT COUNT(*) FROM chunks_fts_ngram"), before)
         self.assertTrue(self.library.fts_integrity_ok())
 
+    def test_fts_metacharacters_never_raise_or_drop_recall(self) -> None:
+        """F1：query 里的 `"` / NUL / `;` 不能拼出非法 FTS5 短语。
+
+        二元组直接取自相邻字符：`上皮细胞"` 会生成 bigram `胞"` → `"胞""`（未闭合
+        字符串），`"; DROP …` 生成含 `;` 的二元组 → syntax error；而
+        `上皮细胞"的构造` 只是静默 0 行（同一根因时炸时静默，比稳定报错更危险）。
+        """
+        chunks_before = self._count("SELECT COUNT(*) FROM chunks")
+        self.assertTrue(self.library.search("上皮组织", 3))  # 前置：库里确实有这个术语
+        for query in ('上皮细胞"', '"; DROP TABLE chunks; --', "上皮\x00组织"):
+            with self.subTest(query=query):
+                self.assertIsInstance(self.library.search(query, 3), list)
+        hits = self.library.search('上皮细胞"的构造', 3)
+        self.assertTrue(hits, "含引号的 query 不得静默 0 行（应过滤坏二元组后继续召回）")
+        self.assertIn("上皮细胞", hits[0]["text"])
+        # 注入尝试不能真的动到表
+        self.assertEqual(self._count("SELECT COUNT(*) FROM chunks"), chunks_before)
+
+    def test_limit_none_falls_back_to_default(self) -> None:
+        """F2：MCP/JSON 客户端会把 limit 传成 null，``int(None)`` 不该抛 TypeError。"""
+        self.assertEqual(
+            self.library.search("上皮组织", None),
+            self.library.search("上皮组织", 5),
+        )
+        self.assertTrue(self.library.search("上皮组织", None))
+
 
 class NgramMaintenanceTests(unittest.TestCase):
     def setUp(self) -> None:

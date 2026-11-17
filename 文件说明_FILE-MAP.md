@@ -35,7 +35,7 @@ This file explains what every item is for, and whether it can be moved, deleted,
 | `res/` | 教材资源：原版 PDF + 流水线产物 + 索引指向的数据 | Textbook resources | ❌ 本地数据 | 可整体移动，但内部结构不能改（见第四节） |
 | `.medical_rag/` | 索引数据库与缓存（`library.sqlite3`、`pdf_text/`、`web_cache/`） | Local index & caches | ❌ 本地数据 | 可移动；删掉后需重建索引（检索暂时为空） |
 | `tests/` | 自动化测试（含“移动目录后索引仍可用”的回归测试） | Automated tests | ✅ | **保留**；`test_relocation.py` 专门验证可移动性 |
-| `tools/` | 流水线子进程脚本（OCR/版面/表格/纠错/结构化） | Pipeline subprocess scripts | ✅ | **保留**；文件名被 `pipeline.py` 引用，改名要同步改代码 |
+| `tools/` | 流水线子进程脚本（OCR/版面/表格/纠错/结构化），以及它们共用的 `tools_common.py` | Pipeline subprocess scripts | ✅ | **保留**；文件名被 `pipeline.py` 引用，改名要同步改代码 |
 | `scripts/` | 内部启动脚本与虚拟环境重建脚本 | Internal launchers & venv rebuild | ✅ | **保留** |
 | `docs/` | 项目文档（如《系统解剖学》标题清单） | Project docs | ✅ | 可保留 |
 | `.pi/` | Agent 平台（Pi / Codex）的技能与扩展定义 | Agent platform skill/extension | ✅ | 保留；与网页/检索运行无关 |
@@ -45,10 +45,11 @@ This file explains what every item is for, and whether it can be moved, deleted,
 | `.build/` | 渲染缓存、pytest 缓存等构建产物 | Build & test caches | ❌ | **可随时删除**，会自动重建 |
 | `.git/` | Git 版本库（含一个外部 Codex 工作树注册） | Git repository | — | 保留；移动仓库本身不影响主仓库 |
 
-## 三、`tools/` 流水线脚本（被 `medical_rag/pipeline.py` 以子进程调用）
+## 三、`tools/` 流水线脚本与共用工具（脚本被 `medical_rag/pipeline.py` 以子进程调用）
 
 | 文件 File | 中文用途 | English purpose | 运行环境 |
 | --- | --- | --- | --- |
+| `tools_common.py` | OCR/版面/表格/纠错这几个脚本共用的产物读写工具：原子写文本、单页 JSON 完整性校验、带 PDF 指纹的页图缓存 | Shared helpers for the OCR/layout/table/fix scripts: atomic write, page-JSON validation, render cache | 不单独运行，被下列脚本 `import` |
 | `tools_ocr_v3.py` | 逐页 OCR 识别，输出 `text_v3/boxes/page-*.json` | Page OCR → boxes | `.venv-ocr` |
 | `tools_layout_v3.py` | 版面分析（PP-StructureV3），输出 `text_v3/layout.json` | Layout analysis | `.venv-ocr312` |
 | `tools_table_v3_gpu.py` | 表格识别，输出 `text_v3/tables/page-*.md` | Table recognition | `.venv-ocr312` |
@@ -56,7 +57,7 @@ This file explains what every item is for, and whether it can be moved, deleted,
 | `tools_structure_v3.py` | 把 boxes/表格/版面合成带页码的结构化 Markdown（`processed_v3/structured/`） | Structure Markdown from boxes | `.venv-ocr` |
 | `tools_structure_v2.py` | 旧版结构化脚本（存档；v3 会引用其中部分函数） | Legacy structure script (archive) | `.venv-ocr` |
 
-> 不要单独改名这些 `.py`：`pipeline.py`、`test_pipeline.py` 和脚本之间的 `import` 都按文件名引用。
+> 不要单独改名这些 `.py`：`pipeline.py`、`test_pipeline.py` 和脚本之间的 `import` 都按文件名引用（`tools_common.py` 也是被 `import` 的）。
 
 ## 四、`res/` 教材目录结构（索引指向这里，结构不要改）
 

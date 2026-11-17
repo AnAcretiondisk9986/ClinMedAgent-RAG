@@ -58,12 +58,14 @@ class FeatureReranker:
     ) -> list[dict]:
         if not items:
             return items
-        # 先统一摘掉内部字段（无论能否算出相似度，都不能泄漏到 API 输出）
-        vectors = [deserialize(item.pop("vector", None)) for item in items]
         if not query_vector:
+            # 空查询向量（单字查询等）没有相似度可算：只摘内部字段，不做 decode
             for item in items:
+                item.pop("vector", None)
                 item["vector_similarity"] = 0.0
             return self._sort(items)
+        # 先统一摘掉内部字段（无论能否算出相似度，都不能泄漏到 API 输出）
+        vectors = [deserialize(item.pop("vector", None)) for item in items]
         for item, vector in zip(items, vectors):
             similarity = cosine(dict(query_vector), vector)
             item["vector_similarity"] = round(similarity, 4)

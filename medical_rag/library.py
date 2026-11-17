@@ -5,9 +5,11 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,7 +26,7 @@ from .qa import (
     plan_question,
     strip_book_mention,
 )
-from .rerank import candidates_for_rerank, create_reranker
+from .rerank import VECTOR_RERANK_SIZE, candidates_for_rerank, create_reranker
 
 ROOT = PROJECT_ROOT
 DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
@@ -53,7 +55,22 @@ def _tokens(value: str) -> list[str]:
     return re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]", value)
 
 
+def _as_limit(value: Any, default: int) -> int:
+    """把 limit 兜底成 int。
+
+    JSON/MCP 客户端会把 ``null``、字符串或别的类型直接传进来（``limit: null`` 是
+    常见退化），``int(None)`` 会抛 TypeError 变成一条无信息量的工具错误。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@lru_cache(maxsize=20000)
 def _normalise(value: str) -> str:
+    # 同一次检索里 section/book/候选正文会被反复规范化；缓存是纯函数记忆，
+    # 不影响结果（实测 search("红") warm 245 → 196 ms）。
     return re.sub(r"\s+", "", _correct_terms(value).lower())
 
 COMMON_OCR_FIXES = {
@@ -208,6 +225,18 @@ class Library:
         self.reranker, self.reranker_warning = create_reranker(
             os.environ.get("MEDICAL_RAG_RERANKER")
         )
+        # sqlite 连接只能由创建它的线程使用/关闭（sqlite3 默认 check_same_thread=True）。
+        # WebApp.close_libraries() 在别的线程收尾时靠这三个字段做诚实记账，见
+        # request_close()/_ensure_open()。
+        self.owner_thread = threading.get_ident()
+        self._close_requested = False
+        self.closed = False
+        # 只读介质上 schema 迁移写不进去时降级为“尽力检索”，并把原因留在 warnings 里
+        self.readonly = False
+        # 二元组索引是否完整：只读介质上回填失败时置 False，检索退回全表扫描。
+        # 不能留着不完整的索引硬用——那样中文 query 会静默 0 行，比直接报错更危险。
+        self.ngram_ready = True
+        self.warnings: list[str] = []
         self.cx = sqlite3.connect(self.db, timeout=30.0)
         self.cx.row_factory = sqlite3.Row
         # 并发写靠 busy_timeout 串行化；WAL 让重建索引期间读者不被阻塞
@@ -217,20 +246,61 @@ class Library:
         self._init_schema()
 
     def close(self) -> None:
+        self._close_requested = False
         try:
             if self.cx.in_transaction:  # 未提交的写事务回滚，避免留下半套索引
                 self.cx.rollback()
         except sqlite3.Error:
             pass
-        finally:
-            self.cx.close()
+        self.cx.close()
+        self.closed = True
+
+    def request_close(self) -> None:
+        """登记“请关闭”（可从任意线程调用，不实际关闭）。
+
+        sqlite 连接只能由创建它的线程 ``close()``：别的线程调用会抛
+        ``sqlite3.ProgrammingError: SQLite objects created in a thread can only be used
+        in that same thread``。所以跨线程收尾时只置位，真正的关闭交给 owner 线程在
+        下一次操作（``_ensure_open``）或 ``release_thread_library()`` 里执行。
+        """
+        self._close_requested = True
+
+    def _close_now(self) -> bool:
+        """在 owner 线程里补做被推迟的关闭；返回是否真的关闭过。"""
+        if not self._close_requested:
+            return False
+        self._close_requested = False
+        self.close()
+        return True
+
+    def _ensure_open(self) -> None:
+        """owner 线程发现“别的线程已登记关闭”时，就地关闭并明确报错。"""
+        if not self._close_requested:
+            return
+        self._close_now()
+        raise RuntimeError(
+            "Library 已关闭（closed）：close_libraries() 已从其它线程登记关闭，"
+            "本线程回收了连接，请重新创建 Library"
+        )
+
+    def _ensure_writable(self) -> None:
+        """写操作在只读库上要给中文说明，而不是裸 sqlite3.OperationalError。"""
+        self._ensure_open()
+        if self.readonly:
+            raise RuntimeError(
+                "索引库当前为只读，无法写入：请把库文件及其所在目录改为可写后重试"
+                "（本次打开时 schema 迁移失败，已按现有结构尽力检索）"
+            )
 
     def _init_schema(self) -> None:
+        # 已是最新 schema 时不写盘：普通打开的代价应该只有读。以前无条件写回
+        # user_version 并提交，新连接首次写 page1 + WAL 提交实测 39~93 ms；而且
+        # 只读库会直接打不开（attempt to write a readonly database）。
+        current_version = int(self.cx.execute("PRAGMA user_version").fetchone()[0])
         extra_columns = "".join(
             f",\n                {name} {kind}" for name, kind in BOOK_FINGERPRINT_COLUMNS
         )
-        self.cx.executescript(
-            f"""
+        ddl = f"""
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS books (
                 id INTEGER PRIMARY KEY,
@@ -266,14 +336,58 @@ class Library:
                 backend TEXT NOT NULL,
                 vector TEXT NOT NULL
             );
+            -- 向量按后端清理/计数都要按 backend 过滤；没有索引时每次打开全表扫
+            CREATE INDEX IF NOT EXISTS idx_chunk_vectors_backend ON chunk_vectors(backend);
             """
-        )
-        self._migrate_books()
-        self._migrate_paths()
-        self._backfill_ngram_index()
-        self._backfill_vector_index()
-        self.cx.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        self.cx.commit()
+        try:
+            # DDL 也算写：只读库上 CREATE INDEX/建表同样会抛 readonly，
+            # 所以和迁移、回填放进同一个降级分支里。
+            self.cx.executescript(ddl)
+            self._migrate_books()
+            self._migrate_paths()
+            self._backfill_ngram_index()
+            self._backfill_vector_index()
+            if current_version != SCHEMA_VERSION:
+                self.cx.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            if self.cx.in_transaction:  # 迁移/回填真的写过才提交
+                self.cx.commit()
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower():
+                raise
+            # 只读介质（attrib +R / 受限 ACL）：老库迁不上去、索引回填不了，
+            # 就按现有结构尽力检索，别让整个库打不开；写操作由 _ensure_writable()
+            # 明确报错。二元组索引一旦不完整，检索必须退回全表扫描（见 _candidate_rows），
+            # 否则中文 query 会静默 0 行。
+            self.readonly = True
+            self.ngram_ready = self._ngram_index_complete()
+            missing = (
+                f"schema 迁移/索引回填（v{current_version}→v{SCHEMA_VERSION}）"
+                if current_version != SCHEMA_VERSION
+                else "索引回填"
+            )
+            self.warnings.append(
+                f"只读库无法完成{missing}：已按现有结构尽力检索"
+                + ("，中文检索退回全表扫描（较慢）" if not self.ngram_ready else "")
+                + "；写入（ingest/rebuild）不可用"
+            )
+
+    def _ngram_index_complete(self) -> bool:
+        """二元组索引行数是否覆盖全部证据块（只读可判断，不写库）。"""
+        try:
+            chunks = int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+            if not chunks:
+                return True
+            try:
+                indexed = int(
+                    self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram_docsize").fetchone()[0]
+                )
+            except sqlite3.Error:
+                indexed = int(
+                    self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0]
+                )
+            return indexed >= chunks
+        except sqlite3.Error:
+            return False
 
     def _migrate_books(self) -> None:
         """老库幂等补齐来源指纹列（不重建表，不丢数据）。"""
@@ -362,7 +476,17 @@ class Library:
         chunks = int(self.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         if not chunks:
             return
-        indexed = int(self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0])
+        try:
+            # docsize 是 FTS5 内建影子表，行数即索引行数；比倒排全扫快两个数量级
+            # （实测 27 ms → 0.1 ms）。删除会同步 docsize，语义与 COUNT 相同。
+            indexed = int(
+                self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram_docsize").fetchone()[0]
+            )
+        except sqlite3.Error:
+            # 老库若用 columnsize=0 建表就没有该影子表，回退旧 SQL
+            indexed = int(
+                self.cx.execute("SELECT COUNT(*) FROM chunks_fts_ngram").fetchone()[0]
+            )
         if indexed >= chunks:
             return
         self.cx.execute("DELETE FROM chunks_fts_ngram")
@@ -396,6 +520,7 @@ class Library:
 
     def rebuild_vector_index(self) -> int:
         """重建向量索引（换嵌入后端或修复后调用）。"""
+        self._ensure_writable()
         self.cx.execute("DELETE FROM chunk_vectors")
         for row in self.cx.execute("SELECT rowid, text FROM chunks").fetchall():
             self._insert_vector(row["rowid"], row["text"])
@@ -549,6 +674,7 @@ class Library:
 
     def rebuild_fts_index(self) -> int:
         """重建三套索引（修复历史遗留的 chunks/chunks_fts 不一致）。"""
+        self._ensure_writable()
         self.cx.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
         self.cx.execute("DELETE FROM chunks_fts_ngram")
         self.cx.execute("DELETE FROM chunk_vectors")
@@ -577,6 +703,7 @@ class Library:
             yield buffer
 
     def ingest(self, pdf: Path | str, title: str | None = None) -> IngestReport:
+        self._ensure_writable()
         path = Path(pdf).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(path)
@@ -649,6 +776,7 @@ class Library:
 
     def ingest_markdown_tree(self, text_dir: Path | str, title: str | None = None) -> IngestReport:
         """Index processed Markdown while preserving chapter/page citations."""
+        self._ensure_writable()
         root = Path(text_dir).expanduser().resolve()
         files = sorted((root / "structured").glob("*.md")) if (root / "structured").exists() else sorted(root.rglob("*.md"))
         files = [f for f in files if f.name not in {"README.md", "book.md"} and not is_internal_output(f)]
@@ -791,17 +919,20 @@ class Library:
         ]
 
     def list_books(self) -> list[dict]:
+        self._ensure_open()
         return [
             self._absolutise(dict(row)) or {}
             for row in self.cx.execute("SELECT * FROM books ORDER BY title")
         ]
 
     def get_book(self, book_id: int) -> dict | None:
+        self._ensure_open()
         row = self.cx.execute("SELECT * FROM books WHERE id=?", (int(book_id),)).fetchone()
         return self._absolutise(dict(row)) if row else None
 
     def chunks_for_page(self, book_id: int, page: int) -> list[dict]:
         """按书 + 原书页码返回该页的全部证据块（用于网页预览正文）。"""
+        self._ensure_open()
         rows = self.cx.execute(
             "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book "
             "FROM chunks c JOIN books b ON b.id=c.book_id "
@@ -811,6 +942,7 @@ class Library:
         return [dict(row) for row in rows]
 
     def page_range(self, book_id: int) -> tuple[int, int] | None:
+        self._ensure_open()
         row = self.cx.execute(
             "SELECT MIN(page) AS lo, MAX(page) AS hi FROM chunks WHERE book_id=?",
             (int(book_id),),
@@ -826,23 +958,34 @@ class Library:
 
         优先用二元组 FTS5 索引定位候选：既避免全表扫描，又顺带取出缓存的
         ``norm_text``（不再对每一块重算 _normalise）。
-        出现单字词时无法用二元组表达，回退全表扫描以保证召回不降级。
+        出现单字词时无法用二元组表达，回退全表扫描以保证召回不降级：混排
+        “骨 构造”这类查询里，命中页可能只含单字，按多字 token 预筛会直接丢掉它
+        （``tests/test_medical_rag.py`` 与 ``test_ngram_search.py`` 都锁了这个行为）。
+        向量不在这里取：只有前 200 条参与重排，按需二次取（见 _vectors_for）。
         """
         bigrams: set[str] = set()
         if tokens and all(len(token) >= 2 for token in tokens):
             bigrams.update(q[i:i + 2] for i in range(max(0, len(q) - 1)))
             for token in tokens:
                 bigrams.update(token[i:i + 2] for i in range(len(token) - 1))
-        bigrams = {gram for gram in bigrams if gram.strip()}
+        # 二元组直接取自用户 query 的相邻字符，可能带着 FTS5 的元字符：`"` 会让短语
+        # 未闭合（`"胞""`）、NUL 同样破句。unicode61 本来就把 `"` 当分隔符，这类
+        # 二元组不可能作为单个 token 命中，直接丢掉最省事也最安全。
+        bigrams = {
+            gram
+            for gram in bigrams
+            if gram.strip() and '"' not in gram and "\x00" not in gram
+        }
 
-        if bigrams:
+        # 只读介质上二元组索引可能没回填完整：此时必须走全表扫描，否则中文
+        # query 会在不完整的索引上静默 0 行（见 _init_schema 的降级分支）。
+        if bigrams and self.ngram_ready:
             match = " OR ".join(f'"{gram}"' for gram in sorted(bigrams))
             sql = (
                 "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
-                "n.norm_text AS norm_text, v.vector AS vector "
+                "n.norm_text AS norm_text "
                 "FROM chunks_fts_ngram n JOIN chunks c ON c.rowid = n.rowid "
                 "JOIN books b ON b.id = c.book_id "
-                "LEFT JOIN chunk_vectors v ON v.rowid = c.rowid "
                 "WHERE n.bigrams MATCH ?"
             )
             params: list[Any] = [match]
@@ -850,13 +993,17 @@ class Library:
                 placeholders = ",".join("?" for _ in book_ids)
                 sql += f" AND c.book_id IN ({placeholders})"
                 params.extend(sorted(book_ids))
-            return self.cx.execute(sql, params).fetchall()
+            try:
+                return self.cx.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                # 其它 FTS5 元字符（例如 `"; DROP …` 生成的分号二元组）仍可能让
+                # 表达式非法。宁可退到全表扫描慢一点，也不能把这一整遍召回静默丢掉。
+                pass
 
         sql = (
             "SELECT c.chunk_id,c.page,c.section,c.text,b.title AS book,b.path,"
-            "NULL AS norm_text, v.vector AS vector "
-            "FROM chunks c JOIN books b ON b.id=c.book_id "
-            "LEFT JOIN chunk_vectors v ON v.rowid = c.rowid"
+            "NULL AS norm_text "
+            "FROM chunks c JOIN books b ON b.id=c.book_id"
         )
         if book_ids:
             placeholders = ",".join("?" for _ in book_ids)
@@ -864,6 +1011,28 @@ class Library:
                 f"{sql} WHERE c.book_id IN ({placeholders})", tuple(sorted(book_ids))
             ).fetchall()
         return self.cx.execute(sql).fetchall()
+
+    def _vectors_for(self, chunk_ids: list[str]) -> dict[str, str | None]:
+        """按 chunk_id 二次取向量文本（只对参与重排的有界候选取）。
+
+        以前向量随候选 SQL 一起 LEFT JOIN 回来，一次查询要传 1.76~2.01 MB 文本，
+        而 rerank 只对前 200 条用得上。join 条件（rowid）与原来一致，取值逐条相同。
+        """
+        if not chunk_ids:
+            return {}
+        result: dict[str, str | None] = {}
+        for start in range(0, len(chunk_ids), 200):
+            batch = chunk_ids[start:start + 200]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.cx.execute(
+                "SELECT c.chunk_id AS chunk_id, v.vector AS vector FROM chunks c "
+                "LEFT JOIN chunk_vectors v ON v.rowid = c.rowid "
+                f"WHERE c.chunk_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                result[row["chunk_id"]] = row["vector"]
+        return result
 
     def _python_search(self, query: str, limit: int, book_ids: set[int] | None = None) -> list[dict]:
         q = _normalise(query)
@@ -873,41 +1042,56 @@ class Library:
         from .qa import extract_concepts
 
         concepts = [_normalise(term) for term in extract_concepts(query)]
-        tokens = [_normalise(t) for t in concepts if _normalise(t)]
+        tokens = [t for t in concepts if t]
         if not tokens:
             tokens = [_normalise(t) for t in _tokens(query) if t.strip()]
         if not q or not tokens:
             return []
         rows = self._candidate_rows(q, tokens, book_ids)
-        scored: list[tuple[float, sqlite3.Row]] = []
+        # 每行只留“排序键 + 打分明细”，item 留给最终参与重排的前 200 条构造
+        scored: list[tuple[float, int, str, sqlite3.Row, tuple]] = []
         # Character n-grams help recall OCR variants; concept coverage and
         # metadata boosts prevent generic words such as “位置/特点” from
         # dominating the ranking.
         qgrams = {q[i:i + 2] for i in range(max(0, len(q) - 1))} or {q}
         # 相邻概念连写（如“肩关节组成”），在定义式行文里会真正出现
         phrases = [f"{left}{right}" for left, right in zip(tokens, tokens[1:])]
+        section_cache: dict[str, str] = {}
+        book_cache: dict[str, str] = {}
         for row in rows:
             # norm_text 来自二元组索引的缓存；回退全表扫描时为 NULL，现场规范化
             cached = row["norm_text"]
             raw_text = row["text"]
             text = cached if cached is not None else _normalise(raw_text)
-            section = _normalise(row["section"])
-            book = _normalise(row["book"])
-            grams = {text[i:i + 2] for i in range(max(0, len(text) - 1))}
-            overlap = len(qgrams & grams) / max(len(qgrams), 1)
+            # 命中门槛放在最前面：不命中的候选连二元组集合都不用建
             matched = [term for term in tokens if term in text]
             # Require at least one meaningful concept match. This avoids
             # returning a page only because a generic question phrase overlaps.
             if not matched:
                 continue
+            section_key = row["section"]
+            section = section_cache.get(section_key)
+            if section is None:
+                section = section_cache[section_key] = _normalise(section_key)
+            book_key = row["book"]
+            book = book_cache.get(book_key)
+            if book is None:
+                book = book_cache[book_key] = _normalise(book_key)
+            grams = {text[i:i + 2] for i in range(max(0, len(text) - 1))}
+            overlap = len(qgrams & grams) / max(len(qgrams), 1)
             coverage = len(matched) / max(len(tokens), 1)
-            hits = sum(text.count(term) for term in matched)
+            # counts 同时喂给 hits 与 concept_boost，不再对同一批 token 数两遍
+            # counts 保留 token 列表语义（不去重）：同一概念重复出现时旧实现按
+            # 列表累加 hits/concept_boost，改成 dict 会把重复项合并、改变分数
+            # （实测 "DNA dna 复制" 的 top-1 会变）。这里只做「每 token 只 count 一次」。
+            counts = [(term, text.count(term)) for term in matched]
+            hits = sum(count for _, count in counts)
             exact = q in text
             phrase_hits = [phrase for phrase in phrases if phrase in text]
             proximity = _proximity(text, matched)
             section_hits = sum(1 for term in tokens if term in section)
             book_boost = sum(0.25 for term in tokens if term in book)
-            concept_boost = sum(min(text.count(term), 3) * 0.55 for term in matched)
+            concept_boost = sum(min(count, 3) * 0.55 for _, count in counts)
             heading_hit = any(term in text[:40] for term in matched)
             penalty, penalties = _quality_penalty(raw_text)
             score = (
@@ -924,18 +1108,40 @@ class Library:
             ) * penalty
             if score <= 0:
                 continue
+            scored.append(
+                (
+                    score,
+                    int(row["page"]),
+                    str(row["chunk_id"]),
+                    row,
+                    (
+                        exact, phrase_hits, proximity, section_hits, heading_hit,
+                        matched, penalties, coverage,
+                    ),
+                )
+            )
+        scored.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
+        # 只对最终参与重排的有界候选构造 item、取向量
+        pool = scored[:VECTOR_RERANK_SIZE]
+        vectors = self._vectors_for([entry[2] for entry in pool])
+        candidates: list[dict] = []
+        for score, _page, chunk_id, row, detail in pool:
             item = self._absolutise(dict(row)) or {}
             item.pop("norm_text", None)  # 内部缓存字段，不对外暴露
-            # 注意：vector 必须留到重排阶段再用，不能在这里 pop
+            item.pop("vector", None)  # 向量按 chunk_id 二次取，见 _vectors_for
+            item["vector"] = vectors.get(chunk_id)
             item["score"] = round(score, 4)
-            item["match_reason"] = _match_reasons(
-                exact, phrase_hits, proximity, section_hits, heading_hit, matched, penalties
-            )
-            scored.append((score, item))
-        scored.sort(key=lambda x: (-x[0], x[1]["page"], x[1]["chunk_id"]))
+            item["match_reason"] = _match_reasons(*detail[:7])
+            # 引用可靠性信号：只暴露给调用方复核，不参与排名、不影响 status
+            item["coverage"] = round(detail[7], 4)
+            item["matched_concepts"] = list(detail[5])
+            item["subject_matched"] = bool(detail[5]) and detail[5][0] == tokens[0]
+            candidates.append(item)
         # 向量通道只对词法候选做有界重排（见 rerank.py：不独立全库召回）
-        ranked = candidates_for_rerank(scored)
-        self.reranker.rerank(ranked, self.embedding.embed([q])[0])
+        ranked = self.reranker.rerank(
+            candidates_for_rerank([(float(item["score"]), item) for item in candidates]),
+            self.embedding.embed([q])[0],
+        )
         return ranked[:limit]
 
     def _resolve_book_ids(self, book: int | str | None, books: list[dict] | None = None) -> set[int] | None:
@@ -962,7 +1168,8 @@ class Library:
         return {row["id"] for row in rows if text in row["title"]} or set()
 
     def search(self, query: str, limit: int = 5, book: int | str | None = None) -> list[dict]:
-        limit = max(1, min(int(limit), 50))
+        self._ensure_open()
+        limit = max(1, min(_as_limit(limit, 5), 50))
         book_ids = self._resolve_book_ids(book)
         if book_ids is not None and not book_ids:
             return []
@@ -997,6 +1204,7 @@ class Library:
 
     def get_context(self, chunk_id: str, radius: int = 1, limit: int = 5) -> list[dict]:
         """Return nearby chunks from the same book for cross-page answers."""
+        self._ensure_open()
         row = self.cx.execute("SELECT book_id,page FROM chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
         if not row:
             return []
@@ -1060,7 +1268,7 @@ class Library:
         if not plan.question:
             return {"status": "invalid_question", "message": "题目不能为空"}
 
-        limit = max(1, min(int(limit), 20))
+        limit = max(1, min(_as_limit(limit, 6), 20))
         merged: dict[str, dict] = {}
         for query_index, query in enumerate(plan.queries):
             for rank, result in enumerate(self.search(query, max(limit * 2, 8), book=book_ids), start=1):
@@ -1163,6 +1371,7 @@ class Library:
                 ]
 
     def get_chunk(self, chunk_id: str) -> dict | None:
+        self._ensure_open()
         row = self.cx.execute(
             "SELECT c.*,b.title AS book,b.path FROM chunks c JOIN books b ON b.id=c.book_id WHERE c.chunk_id=?",
             (chunk_id,),

@@ -154,12 +154,6 @@ def create_backend(spec: str | None = None) -> tuple[EmbeddingBackend, str]:
     ``ollama:<model>``。语义后端不可用时**自动回退词法后端**并返回警告，
     保证检索永远可用（Ollama 是可选增强，不是硬依赖）。
     """
-    """按配置创建后端，返回 (后端, 警告说明)。
-
-    配置来自 ``MEDICAL_RAG_EMBEDDING``：``lexical``（默认）或
-    ``ollama:<model>``。语义后端不可用时**自动回退词法后端**并返回警告，
-    保证检索永远可用（Ollama 是可选增强，不是硬依赖）。
-    """
     spec = (spec or "").strip()
     if not spec or spec == DEFAULT_BACKEND:
         return LexicalEmbedding(), ""

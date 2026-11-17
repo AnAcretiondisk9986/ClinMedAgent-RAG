@@ -50,13 +50,27 @@ const state = {
   knownStatus: {},
   uploadFile: null,
   textRequest: 0,
+  pageText: [],
+  pageSignal: "",
   taskEls: new Map(),
 };
 
 /* ------------------------------------------------------------------ 工具 */
 
+/** 本地服务也可能挂住（例如在控制台选中文字冻结了 stdout），统一加超时，避免界面永久“加载中”。 */
+const API_TIMEOUT = 15000;
+
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const { timeout = API_TIMEOUT, ...rest } = options;
+  const signal = rest.signal ?? (typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(timeout) : undefined);
+  let response;
+  try {
+    response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...rest, signal });
+  } catch (error) {
+    if (error && error.name === "TimeoutError") throw new Error(`后端 ${Math.round(timeout / 1000)} 秒无响应，请检查启动窗口是否被选中卡住`);
+    if (error && error.name === "AbortError") throw new Error("请求已取消");
+    throw error;
+  }
   let payload;
   try {
     payload = await response.json();
@@ -149,6 +163,23 @@ function bookBadges(book, running) {
   return `<span class="badge plain">无 PDF</span>`;
 }
 
+/** 书卡真正渲染消费的字段：侧栏签名只认这些，禁止直接序列化整个 book。 */
+function bookCardModel(book) {
+  return {
+    id: book.id,
+    title: book.title,
+    index_title: book.index_title || "",
+    pages: book.status?.pdf?.pages || book.quality?.pages || 0,
+    chunks: book.status?.index?.chunks || 0,
+    progress: bookProgress(book),
+    badge: bookBadges(book, isBookRunning(book.id)),
+    mtime: book.status?.pdf?.mtime || "",
+    hasPdf: Boolean(book.pdf),
+    indexed: Boolean(book.status?.index?.complete),
+    active: Boolean(state.selected && state.selected.id === book.id),
+  };
+}
+
 function renderBookList() {
   const list = $("#book-list");
   const firstRender = !list.dataset.hydrated;
@@ -160,7 +191,20 @@ function renderBookList() {
     return (!needle || name.includes(needle)) && (filter === "all" || (filter === "ready" ? ready : !ready));
   });
   $("#book-count").textContent = String(state.books.length);
+  const dashboardBooks = state.books.slice(0, 4);
+  // 渲染输入（书库数据 + 选中态 + 筛选条件）没变就跳过整棵重建，否则每次轮询都会清掉侧栏滚动与焦点
+  const signature = JSON.stringify({
+    needle,
+    filter,
+    root: state.root,
+    books: visible.map(bookCardModel),
+    dashboard: dashboardBooks.map(bookCardModel),
+  });
+  if (list.dataset.signature === signature) return;
+  const keepScroll = list.scrollTop;
+  const keepFocus = document.activeElement && list.contains(document.activeElement) ? document.activeElement.dataset.bookId || "" : "";
   list.innerHTML = "";
+  list.dataset.signature = signature;
   if (!visible.length) {
     const hint = state.root ? `<br>也可以把 PDF 放到 <code>${escapeHtml(state.root)}/res/&lt;书名&gt;/PDF/</code> 下再刷新。` : "";
     list.innerHTML = `<div class="muted" style="padding:16px">书库还是空的，点右上角“导入教材”。${hint}</div>`;
@@ -169,6 +213,7 @@ function renderBookList() {
   for (const book of visible) {
     const card = document.createElement("div");
     card.className = "book-card" + (state.selected && state.selected.id === book.id ? " active" : "") + (firstRender ? " initial-enter" : "");
+    card.dataset.bookId = book.id;
     const pages = book.status.pdf.pages || book.quality.pages || 0;
     const chunks = book.status.index.chunks || 0;
     card.innerHTML = `
@@ -193,9 +238,14 @@ function renderBookList() {
     list.appendChild(card);
   }
   list.dataset.hydrated = "true";
+  list.scrollTop = keepScroll; // 重建后把侧栏滚动位置与焦点放回去
+  if (keepFocus) {
+    const focused = list.querySelector(`[data-book-id="${CSS.escape(keepFocus)}"]`);
+    if (focused && typeof focused.focus === "function") focused.focus({ preventScroll: true });
+  }
   const dashboard = $("#dashboard-books");
   if (dashboard) {
-    const recent = state.books.slice(0, 4);
+    const recent = dashboardBooks;
     $("#dashboard-count") && ($("#dashboard-count").textContent = `${state.books.length} 本教材`);
     dashboard.innerHTML = recent.map((book) => `<button class="dashboard-book" data-dashboard-book="${escapeHtml(book.id)}"><span class="dashboard-cover-wrap"></span><span class="dashboard-book-copy"><h4>${escapeHtml(book.title)}</h4><p>${book.status?.pdf?.pages ? `${book.status.pdf.pages} 页` : "页数未知"} · ${book.status?.index?.complete ? "可检索" : "待处理"}</p><span class="resume">${book.status?.index?.complete ? "继续阅读 →" : "开始处理 →"}</span></span></button>`).join("");
     recent.forEach((book) => { const card=dashboard.querySelector(`[data-dashboard-book="${CSS.escape(String(book.id))}"]`); if(!card)return; const img=document.createElement("img"); img.className="dashboard-cover"; img.alt=""; img.loading="lazy"; img.src=`/api/books/${book.id}/cover.png?w=180&v=${book.status?.pdf?.mtime || ""}`; img.onerror=()=>img.replaceWith(coverPlaceholder(book.title)); card.querySelector(".dashboard-cover-wrap").replaceWith(img); card.addEventListener("click",()=>selectBook(book)); });
@@ -293,6 +343,7 @@ function showWelcome() {
   state.page = 1;
   $("#detail").hidden = true;
   $("#search-results").hidden = true;
+  $("#btn-return-search").hidden = true;
   $("#welcome").hidden = false;
   renderBookList();
 }
@@ -342,21 +393,34 @@ async function refreshBooks() {
       }
     }
     renderBookList();
+    return true;
   } catch {
-    /* 静默重试 */
+    return false; // 由调用方决定是否提示，刷新按钮不再无条件报“已刷新”
   }
 }
 
+/** 取图/取文是否值得重刷，只看 PDF 页数、mtime、页偏移与索引块数。 */
+function pageRenderSignal(book) {
+  const status = book.status || {};
+  return [status.pdf?.pages || 0, status.pdf?.mtime || "", status.index?.chunks || 0, Number(book.quality?.page_offset) || 0].join("|");
+}
+
 async function refreshDetail() {
-  if (!state.selected) return;
+  const bookId = state.selected?.id;
+  if (!bookId) return;
   try {
-    const fresh = await api(`/api/books/${state.selected.id}`);
+    const fresh = await api(`/api/books/${bookId}`);
+    // 等待期间用户可能已经切到别的教材：过期结果直接丢弃，否则标题、页码与识别文本会整体回退
+    if (!state.selected || state.selected.id !== fresh.id) return;
     state.selected = fresh;
     state.offset = Number(fresh.quality && fresh.quality.page_offset) || 0;
     state.totalPdfPages = fresh.status.pdf.pages || fresh.quality.pages || 0;
     state.totalPrintedPages = state.offset ? Math.max(0, state.totalPdfPages - state.offset) : 0;
+    const pageOutOfRange = state.page > state.totalPdfPages;
+    state.page = clamp(state.page, 1, state.totalPdfPages || 1);
     renderDetail(fresh);
-    loadPage();
+    // 只有这一本的页面相关内容真的变了才重新取图，避免任务完成时白渲染一张 PNG
+    if (pageOutOfRange || pageRenderSignal(fresh) !== state.pageSignal) loadPage();
   } catch {
     /* 忽略 */
   }
@@ -369,6 +433,30 @@ function setPage(pageNumber) {
   const next = clamp(Number(pageNumber) || 1, 1, total);
   if (next === state.page && state.page !== 0) return;
   state.page = next;
+  loadPage();
+}
+
+/* 滑块拖动去抖：拖动过程中只更新页码，停顿/松手后才真正取图取文。 */
+let pageSliderTimer = null;
+
+function schedulePageNumber(pageNumber) {
+  const total = state.totalPdfPages || 1;
+  const next = clamp(Number(pageNumber) || 1, 1, total);
+  state.page = next;
+  $("#input-pdf").value = String(next);
+  const printed = next - state.offset;
+  $("#input-printed").value = state.offset && printed >= 1 ? String(printed) : "";
+  const slider = $("#page-slider");
+  if (slider) slider.value = String(next);
+  clearTimeout(pageSliderTimer);
+  pageSliderTimer = setTimeout(flushPageNumber, 150);
+}
+
+/** 立即执行挂起的翻页（滑块松手 / 去抖到期）。 */
+function flushPageNumber() {
+  if (!pageSliderTimer) return;
+  clearTimeout(pageSliderTimer);
+  pageSliderTimer = null;
   loadPage();
 }
 
@@ -394,10 +482,14 @@ function fitDisplayWidth() {
   return Math.max(200, Math.min(cssWidth, cssHeight * aspect));
 }
 
-/** 按缩放倍率与屏幕像素比决定服务端渲染宽度（900–2600）；放大时自动取更高清版本。 */
+/** 与服务端 render_page_png 一致的渲染宽度档位（上限 2600 不放宽）。 */
+const RENDER_WIDTHS = [900, 1200, 1600, 2000, 2600];
+
+/** 按缩放倍率与屏幕像素比决定服务端渲染宽度，并量化到固定档位；放大时自动取更高清版本。 */
 function renderWidthFor(displayWidth) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  return Math.max(900, Math.min(2600, Math.round(displayWidth * state.zoomFactor * dpr)));
+  const wanted = Math.round(displayWidth * state.zoomFactor * dpr);
+  return RENDER_WIDTHS.find((width) => width >= wanted) || RENDER_WIDTHS[RENDER_WIDTHS.length - 1];
 }
 
 function captureScroll(stage) {
@@ -523,6 +615,7 @@ function loadPage() {
   const printed = state.page - state.offset;
   $("#input-printed").value = state.offset && printed >= 1 ? String(printed) : "";
   const slider = $("#page-slider"); if (slider) slider.value = String(state.page);
+  state.pageSignal = pageRenderSignal(book); // 记下本次真正渲染的信号，供 refreshDetail 判断是否需要重刷
   applyZoom({ silent: true });
   loadPageText(printed);
 }
@@ -531,11 +624,14 @@ async function loadPageText(printed) {
   const box = $("#page-text");
   const book = state.selected;
   if (!book) return;
+  if (pageSliderTimer) return; // 滑块还在拖动，等 flushPageNumber 落地后再取文本
   if (!$("#toggle-text").checked) {
     box.hidden = true;
     return;
   }
   box.hidden = false;
+  state.pageText = [];
+  $("#transcript-page").textContent = state.offset && printed >= 1 ? `· 原书第 ${printed} 页` : "";
   if (!state.offset || printed < 1 || !book.status.index.found) {
     box.innerHTML = `<div class="empty">${
       book.status.index.found
@@ -550,6 +646,7 @@ async function loadPageText(printed) {
   try {
     const data = await api(`/api/books/${bookId}/text/${printed}`);
     if (requestId !== state.textRequest || !state.selected || state.selected.id !== bookId) return;
+    state.pageText = data.chunks || [];
     if (!data.chunks.length) {
       box.innerHTML = `<div class="empty">原书第 ${printed} 页没有索引文本（可能是图页或已并入相邻页）。</div>`;
       return;
@@ -609,6 +706,7 @@ function renderSearchResults(data) {
   const scopeLabel = $("#search-scope-label");
   if (scopeLabel) scopeLabel.textContent = data.scope ? `· 范围：《${data.scope.title}》` : "· 范围：全部教材";
   const list = $("#search-results-list");
+  $("#search-summary").textContent = data.results.length ? `找到 ${data.results.length} 条证据` : "没有检索到证据";
   if (!data.results.length) {
     const where = data.scope ? `《${escapeHtml(data.scope.title)}》里` : "本地教材";
     list.innerHTML = `<div class="muted">${where}没有检索到“${escapeHtml(data.query)}”的证据。</div>`;
@@ -638,6 +736,7 @@ async function openSearchResult(item) {
     return;
   }
   await selectBook(book);
+  $("#btn-return-search").hidden = false; // 从检索结果跳转后给出回到结果列表的入口
   jumpToPrinted(item.page);
 }
 
@@ -806,7 +905,7 @@ async function inspectPdfPath() {
   box.className = "inspect-result muted";
   box.textContent = "正在检测文字层…";
   try {
-    const data = await api("/api/inspect", { method: "POST", body: JSON.stringify({ path }) });
+    const data = await api("/api/inspect", { method: "POST", body: JSON.stringify({ path }), timeout: 120000 });
     box.className = `inspect-result ${data.kind === "text" ? "ok" : "warn"}`;
     const stages = (data.recommended_stages || []).map((key) => STAGE_LABELS[key] || key).join(" → ");
     box.textContent = `${data.recommendation}推荐阶段：${stages}`;
@@ -838,11 +937,16 @@ function setUploadFile(file) {
   if (!$("#upload-title").value) $("#upload-title").placeholder = file.name.replace(/\.pdf$/i, "");
 }
 
+/* 当前上传的 XHR，供“取消上传”按钮中断。 */
+let pendingUpload = null;
+
 function uploadViaXhr(url, file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    pendingUpload = xhr;
     xhr.open("PUT", url);
     xhr.setRequestHeader("Content-Type", "application/pdf");
+    xhr.timeout = 120000; // 大 PDF 流式上传，超时按 2 分钟放宽
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) onProgress(event.loaded, event.total);
     };
@@ -858,8 +962,10 @@ function uploadViaXhr(url, file, onProgress) {
       else reject(new Error(payload.error || `HTTP ${xhr.status}`));
     };
     xhr.onerror = () => reject(new Error("上传失败：网络错误"));
+    xhr.ontimeout = () => reject(new Error("上传超时（120 秒），请检查后端是否被卡住"));
+    xhr.onabort = () => reject(new Error("上传已取消"));
     xhr.send(file);
-  });
+  }).finally(() => { pendingUpload = null; });
 }
 
 async function submitImport() {
@@ -885,7 +991,7 @@ async function submitImport() {
       const path = $("#path-input").value.trim();
       if (!path) throw new Error("请填写 PDF 路径");
       const title = $("#path-title").value.trim();
-      await api("/api/import", { method: "POST", body: JSON.stringify({ path, title }) });
+      await api("/api/import", { method: "POST", body: JSON.stringify({ path, title }), timeout: 120000 });
       toast("已开始导入", "ok");
     }
     $("#import-modal").hidden = true;
@@ -1002,10 +1108,9 @@ async function reindexSelected() {
 /* ------------------------------------------------------------- 事件绑定 */
 
 function bindEvents() {
-  $("#btn-refresh").addEventListener("click", () => {
-    refreshBooks();
-    pollTasks();
-    toast("已刷新", "ok");
+  $("#btn-refresh").addEventListener("click", async () => {
+    const [ok] = await Promise.all([refreshBooks(), pollTasks()]);
+    toast(ok ? "已刷新" : "刷新失败：后端无响应", ok ? "ok" : "error");
   });
   $("#btn-search").addEventListener("click", doSearch);
   $("#global-search-input").addEventListener("keydown", (event) => {
@@ -1016,6 +1121,7 @@ function bindEvents() {
   });
   $("#btn-search-close").addEventListener("click", () => {
     $("#search-results").hidden = true;
+    $("#btn-return-search").hidden = true;
     if (state.selected) $("#detail").hidden = false;
     else $("#welcome").hidden = false;
   });
@@ -1040,11 +1146,24 @@ function bindEvents() {
     if (event.key === "Enter") jumpToPrinted(Number(event.target.value));
   });
   $("#input-pdf").addEventListener("change", (event) => jumpToPdf(Number(event.target.value)));
-  $("#page-slider").addEventListener("input", (event) => setPage(Number(event.target.value)));
+  $("#page-slider").addEventListener("input", (event) => schedulePageNumber(Number(event.target.value)));
+  $("#page-slider").addEventListener("change", () => flushPageNumber());
   $("#input-pdf").addEventListener("keydown", (event) => {
     if (event.key === "Enter") jumpToPdf(Number(event.target.value));
   });
   $("#toggle-text").addEventListener("change", () => loadPage());
+  $("#btn-copy-page").addEventListener("click", () => {
+    const text = (state.pageText || []).map((chunk) => chunk.text).join("\n\n").trim();
+    if (!text) {
+      toast("当前页没有可复制的识别文本", "error");
+      return;
+    }
+    copyText(text, "已复制本页识别文本");
+  });
+  $("#btn-return-search").addEventListener("click", () => {
+    $("#search-results").hidden = false;
+    $("#detail").hidden = true;
+  });
   $("#btn-zoom-in").addEventListener("click", () => zoomBy(1));
   $("#btn-zoom-out").addEventListener("click", () => zoomBy(-1));
   $("#zoom-label").addEventListener("click", () => setZoom(1));
@@ -1097,6 +1216,10 @@ function bindEvents() {
   $("#btn-inspect").addEventListener("click", inspectPdfPath);
   $("#path-input").addEventListener("change", inspectPdfPath);
   $("#btn-import-submit").addEventListener("click", submitImport);
+  $("#btn-import-cancel")?.addEventListener("click", () => {
+    if (pendingUpload) pendingUpload.abort();
+    else toast("当前没有正在进行的上传", "error");
+  });
   $("#btn-process-submit").addEventListener("click", submitProcess);
 
   $("#btn-task-collapse").addEventListener("click", () => {
@@ -1129,6 +1252,9 @@ function closeAllModals() {
 
 async function init() {
   bindEvents();
+  // 轮询先挂上再拉数据：首个 /api/overview 挂住时页面仍能自行恢复，不会彻底死掉
+  setInterval(pollTasks, 1200);
+  setInterval(() => { if (!$("#welcome").hidden || state.selected) refreshBooks(); }, 6000);
   try {
     const data = await api("/api/overview");
     state.root = data.root;
@@ -1146,8 +1272,6 @@ async function init() {
   } catch (error) {
     toast(`无法连接后端：${error.message}`, "error");
   }
-  setInterval(pollTasks, 1200);
-  setInterval(() => { if (!$("#welcome").hidden || state.selected) refreshBooks(); }, 6000);
 }
 
 document.addEventListener("DOMContentLoaded", init);

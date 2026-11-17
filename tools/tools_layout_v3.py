@@ -17,6 +17,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from tools_common import atomic_write_text, cached_render
+
 
 def register_cuda_dlls() -> None:
     nv = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
@@ -36,21 +38,8 @@ from paddleocr import LayoutDetection  # noqa: E402
 
 
 def render(pdf_path: str, page_number: int, dpi: int, cache_dir: Path) -> tuple[Path, int, int]:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / f"page-{page_number:04d}.png"
-    if out.exists():
-        from PIL import Image
-
-        with Image.open(out) as im:
-            return out, im.width, im.height
-    import fitz
-
-    with fitz.open(pdf_path) as doc:
-        page = doc[page_number - 1]
-        scale = dpi / 72
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
-        pix.save(str(out))
-    return out, pix.width, pix.height
+    """渲染（或复用）页图；缓存键带 PDF size/mtime，换一版 PDF 不会复用旧图。"""
+    return cached_render(pdf_path, page_number, dpi, cache_dir)
 
 
 def main() -> None:
@@ -101,7 +90,8 @@ def main() -> None:
             print(f"  {n}/{end}  {dt:.2f}s/页  表格页累计={sum(1 for v in pages.values() if v['tables'])}", flush=True)
 
     table_pages = sorted(int(k) for k, v in pages.items() if v["tables"] > 0)
-    args.out.write_text(
+    atomic_write_text(
+        args.out,
         json.dumps(
             {
                 "dpi": args.dpi,
