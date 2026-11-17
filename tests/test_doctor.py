@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from medical_rag import doctor
 from medical_rag.library import Library
@@ -187,12 +188,54 @@ class InterpreterPackageTests(unittest.TestCase):
         found = doctor.interpreter_package_versions(str(alias), ("PyMuPDF",))
         self.assertIsNotNone(found["PyMuPDF"])
 
+    def test_probe_import_really_imports_modules(self) -> None:
+        ok, detail = doctor._probe_import(sys.executable, ("fitz",))
+        self.assertTrue(ok, detail)
+
     def test_interpreter_info_marks_missing_venvs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             info = doctor.interpreter_info(Path(tmp))
             self.assertFalse(info["venv_ocr"])
             self.assertFalse(info["venv_ocr312"])
             self.assertTrue(info["python"])
+
+
+class OutputAccessCheckTests(unittest.TestCase):
+    """`doctor` 要提前发现被别的安全上下文写过的（打不开的）产物目录。"""
+
+    def _root_with_book(self, tmp: str) -> Path:
+        root = Path(tmp)
+        (root / "res" / "某教材" / "processed_v3" / "structured").mkdir(parents=True)
+        return root
+
+    def test_reports_ok_for_accessible_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_book(tmp)
+            checks = doctor._output_access_check(root)
+            self.assertEqual([c["name"] for c in checks], ["产物权限"])
+            self.assertEqual(checks[0]["status"], "ok")
+
+    def test_reports_warning_with_hint_when_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_book(tmp)
+            with mock.patch(
+                "medical_rag.outputs.blocked_outputs", return_value=["cleaned", "quality.json"]
+            ):
+                checks = doctor._output_access_check(root)
+        self.assertEqual(checks[0]["status"], "warn")
+        self.assertIn("某教材", checks[0]["detail"])
+        self.assertIn("cleaned", checks[0]["detail"])
+        self.assertIn("takeown", checks[0]["hint"])
+
+    def test_check_is_included_in_environment_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_book(tmp)
+            report = doctor.check_environment(root, Path(tmp) / "none.sqlite3")
+        self.assertIn("产物权限", [item["name"] for item in report["checks"]])
+
+    def test_missing_res_directory_is_not_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(doctor._output_access_check(Path(tmp)), [])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import fitz
 
 from .embeddings import create_backend_cached, serialize
 from .outputs import is_internal_output
+from .paths import PROJECT_ROOT, absolute_path, relative_key, root_for_db, store_path
 from .qa import (
     CONFIDENCE_ORDER,
     SCOPE_MIN_CONFIDENCE,
@@ -25,7 +26,7 @@ from .qa import (
 )
 from .rerank import candidates_for_rerank, create_reranker
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = PROJECT_ROOT
 DEFAULT_DB = ROOT / ".medical_rag" / "library.sqlite3"
 
 # books 表的来源指纹：用于判断"PDF 已替换但索引还是旧的"。
@@ -192,8 +193,10 @@ def _enable_wal(connection: sqlite3.Connection, attempts: int = 6) -> str:
 class Library:
     """Local multi-book evidence library."""
 
-    def __init__(self, db: Path | str | None = None):
+    def __init__(self, db: Path | str | None = None, root: Path | str | None = None):
         self.db = Path(db or os.environ.get("MEDICAL_RAG_DB") or DEFAULT_DB).expanduser().resolve()
+        # 项目根目录：books 表只存相对它的路径，整个目录被移动/复制后仍能定位教材
+        self.root = Path(root).expanduser().resolve() if root else root_for_db(self.db)
         self.db.parent.mkdir(parents=True, exist_ok=True)
         # 教材缩写白名单（内置 + 可选的 aliases.json）
         self.aliases = load_book_aliases(self.db.parent)
@@ -266,6 +269,7 @@ class Library:
             """
         )
         self._migrate_books()
+        self._migrate_paths()
         self._backfill_ngram_index()
         self._backfill_vector_index()
         self.cx.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -277,6 +281,62 @@ class Library:
         for name, kind in BOOK_FINGERPRINT_COLUMNS:
             if name not in existing:
                 self.cx.execute(f"ALTER TABLE books ADD COLUMN {name} {kind}")
+
+    def _migrate_paths(self) -> None:
+        """老库路径迁移：把写死的绝对路径改存为项目内相对路径（幂等）。
+
+        项目目录一旦被移动/复制，旧绝对路径就全部失效（书卡变"未索引"、
+        按书检索报错）。改成相对路径后，无论搬到哪里都能重新挂到当前根目录。
+        无法归一的路径（项目外的自定义 PDF、外部 --db）保持原样，不影响功能。
+        """
+        try:
+            rows = self.cx.execute(
+                "SELECT id, path, source_path, quality_path FROM books"
+            ).fetchall()
+        except sqlite3.Error:
+            return
+        for row in rows:
+            updates: dict[str, str] = {}
+            for column in ("path", "source_path", "quality_path"):
+                value = row[column]
+                if not value:
+                    continue
+                stored = store_path(self.root, value)
+                if stored and stored != value:
+                    updates[column] = stored
+            if not updates:
+                continue
+            assignments = ", ".join(f"{name}=?" for name in updates)
+            try:
+                self.cx.execute(
+                    f"UPDATE books SET {assignments} WHERE id=?",
+                    (*updates.values(), row["id"]),
+                )
+            except sqlite3.Error:
+                # 历史库同一教材有两条记录时，相对路径可能撞 UNIQUE；库被别的进程
+                # 锁住/只读时也会到这里。保留原值交给用户重建索引，迁移本身不把
+                # 库弄坏，也不让"打开书库"因此失败。
+                continue
+
+    def _book_id_for_path(self, stored: str) -> int | None:
+        """按路径找已有的书；绝对/相对、旧根/新根都能对上，重建索引不会重复建书。"""
+        target = relative_key(self.root, stored)
+        for row in self.cx.execute("SELECT id, path FROM books").fetchall():
+            if relative_key(self.root, row["path"]) == target:
+                return int(row["id"])
+        return None
+
+    def _absolutise(self, data: dict[str, Any] | None) -> dict[str, Any] | None:
+        """把库里存的相对路径还原成当前根目录下的绝对路径（对外返回用）。"""
+        if not data:
+            return data
+        for column in ("path", "source_path", "quality_path"):
+            value = data.get(column)
+            if value:
+                resolved = absolute_path(self.root, value)
+                if resolved is not None:
+                    data[column] = str(resolved)
+        return data
 
     @staticmethod
     def _bigram_text(normalized: str) -> str:
@@ -410,7 +470,7 @@ class Library:
         book_dir = text_root.parent
         pdf = find_pdf(book_dir) if book_dir.is_dir() else None
         if pdf is not None:
-            fingerprint["source_path"] = str(pdf)
+            fingerprint["source_path"] = store_path(self.root, pdf)
             try:
                 stat = pdf.stat()
                 fingerprint["source_mtime"] = float(stat.st_mtime)
@@ -432,7 +492,7 @@ class Library:
 
         quality_path = text_root / "quality.json"
         if quality_path.exists():
-            fingerprint["quality_path"] = str(quality_path)
+            fingerprint["quality_path"] = store_path(self.root, quality_path)
             try:
                 quality = json.loads(quality_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -541,8 +601,9 @@ class Library:
                 page_chunks.append((page_number, section, chunk))
         doc.close()
 
-        existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(path),)).fetchone()
-        book_id = existing[0] if existing else None
+        stored_path = store_path(self.root, path)
+        existing = self._book_id_for_path(stored_path)
+        book_id = existing
         if book_id is not None:
             self._delete_book_chunks(book_id)
         now = datetime.now(timezone.utc).isoformat()
@@ -553,7 +614,7 @@ class Library:
             source_mtime, source_size = None, None
         source_sha256 = self._file_sha256(path)
         fingerprint = {
-            "source_path": str(path),
+            "source_path": stored_path,
             "source_sha256": source_sha256,
             "source_mtime": source_mtime,
             "source_size": source_size,
@@ -564,11 +625,15 @@ class Library:
             "quality_path": None,
         }
         book_id = self._upsert_book(
-            book_id, title, str(path), pages, extractable, image_only, fingerprint, now
+            book_id, title, stored_path, pages, extractable, image_only, fingerprint, now
         )
 
         for ordinal, (page, section, text) in enumerate(page_chunks):
-            digest = hashlib.sha1(f"{path}:{page}:{ordinal}:{text}".encode("utf-8")).hexdigest()[:20]
+            # chunk_id 由“相对路径 + 页码 + 序号 + 正文”决定：同一本书重索引/换目录后
+            # 仍是同一批 id，重复建索引不会产出两套证据块
+            digest = hashlib.sha1(
+                f"{stored_path}:{page}:{ordinal}:{text}".encode("utf-8")
+            ).hexdigest()[:20]
             cur = self.cx.execute(
                 "INSERT INTO chunks(chunk_id,book_id,page,section,text) VALUES(?,?,?,?,?)",
                 (digest, book_id, page, section, text),
@@ -590,21 +655,26 @@ class Library:
         if not files:
             raise FileNotFoundError(f"未找到可索引 Markdown：{root}")
         title = title or root.parent.name
+        stored_path = store_path(self.root, root)
         # 整本重建在一个写事务里完成：中途失败不会留下半套索引，并发重建在此串行化
         self.cx.execute("BEGIN IMMEDIATE")
-        existing = self.cx.execute("SELECT id FROM books WHERE path = ?", (str(root),)).fetchone()
-        book_id = existing[0] if existing else None
+        existing = self._book_id_for_path(stored_path)
+        book_id = existing
         if book_id is not None:
             self._delete_book_chunks(book_id)
         now = datetime.now(timezone.utc).isoformat()
         fingerprint = self._source_fingerprint(root, files)
         book_id = self._upsert_book(
-            book_id, title, str(root), len(files), len(files), 0, fingerprint, now
+            book_id, title, stored_path, len(files), len(files), 0, fingerprint, now
         )
         count = 0
         max_source_page = 0
         for file in files:
             content = file.read_text(encoding="utf-8", errors="ignore")
+            try:
+                file_rel = file.relative_to(root).as_posix()
+            except ValueError:
+                file_rel = file.name
             chapter = file.stem
             page = 0
             heading = ""
@@ -614,7 +684,8 @@ class Library:
                 text = " ".join(x.strip() for x in buffer if x.strip()).strip()
                 if not text: return
                 section = f"{chapter} · {heading}" if heading else chapter
-                digest = hashlib.sha1(f"{root}:{file}:{page}:{count}:{text}".encode("utf-8")).hexdigest()[:20]
+                # chunk_id 只用相对路径：同一本书换目录 / 重索引后 id 不变
+                digest = hashlib.sha1(f"{stored_path}:{file_rel}:{page}:{count}:{text}".encode("utf-8")).hexdigest()[:20]
                 cur2 = self.cx.execute("INSERT INTO chunks(chunk_id,book_id,page,section,text) VALUES(?,?,?,?,?)", (digest, book_id, page, section, text))
                 self.cx.execute("INSERT INTO chunks_fts(rowid,text,section) VALUES(?,?,?)", (cur2.lastrowid, text, section))
                 self._insert_ngram(cur2.lastrowid, text)
@@ -652,18 +723,21 @@ class Library:
         if row is None:
             return {"known": False, "book_id": int(book_id)}
         data = dict(row)
+        # 库里存的是相对路径（或老库的旧绝对路径），统一还原到当前根目录再判断时效
+        source = absolute_path(self.root, data.get("source_path"))
+        quality_path = absolute_path(self.root, data.get("quality_path"))
         info: dict[str, Any] = {
             "known": True,
             "book_id": int(book_id),
             "title": data.get("title"),
-            "source_path": data.get("source_path"),
+            "source_path": str(source) if source else data.get("source_path"),
             "source_mtime": data.get("source_mtime"),
             "source_size": data.get("source_size"),
             "content_hash": data.get("content_hash"),
             "pipeline_version": data.get("pipeline_version"),
             "indexed_at": data.get("indexed_at"),
             "page_offset": data.get("page_offset"),
-            "quality_path": data.get("quality_path"),
+            "quality_path": str(quality_path) if quality_path else data.get("quality_path"),
             "has_fingerprint": data.get("content_hash") is not None,
             "stale": False,
             "reason": "",
@@ -671,12 +745,11 @@ class Library:
         if not info["has_fingerprint"]:
             info.update(stale=True, reason="索引没有来源指纹（旧版本建立），建议重建索引")
             return info
-        source = data.get("source_path")
-        if not source or not Path(source).exists():
-            info.update(stale=True, reason=f"源 PDF 不存在：{source}")
+        if source is None or not source.exists():
+            info.update(stale=True, reason=f"源 PDF 不存在：{info['source_path']}")
             return info
         try:
-            stat = Path(source).stat()
+            stat = source.stat()
         except OSError as exc:
             info.update(stale=True, reason=f"源 PDF 不可读：{exc}")
             return info
@@ -718,11 +791,14 @@ class Library:
         ]
 
     def list_books(self) -> list[dict]:
-        return [dict(row) for row in self.cx.execute("SELECT * FROM books ORDER BY title")]
+        return [
+            self._absolutise(dict(row)) or {}
+            for row in self.cx.execute("SELECT * FROM books ORDER BY title")
+        ]
 
     def get_book(self, book_id: int) -> dict | None:
         row = self.cx.execute("SELECT * FROM books WHERE id=?", (int(book_id),)).fetchone()
-        return dict(row) if row else None
+        return self._absolutise(dict(row)) if row else None
 
     def chunks_for_page(self, book_id: int, page: int) -> list[dict]:
         """按书 + 原书页码返回该页的全部证据块（用于网页预览正文）。"""
@@ -848,7 +924,7 @@ class Library:
             ) * penalty
             if score <= 0:
                 continue
-            item = dict(row)
+            item = self._absolutise(dict(row)) or {}
             item.pop("norm_text", None)  # 内部缓存字段，不对外暴露
             # 注意：vector 必须留到重排阶段再用，不能在这里 pop
             item["score"] = round(score, 4)
@@ -917,7 +993,7 @@ class Library:
                    WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?""",
                 (match, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._absolutise(dict(row)) or {} for row in rows]
 
     def get_context(self, chunk_id: str, radius: int = 1, limit: int = 5) -> list[dict]:
         """Return nearby chunks from the same book for cross-page answers."""
@@ -933,7 +1009,7 @@ class Library:
                ORDER BY c.page,c.rowid LIMIT ?""",
             (row["book_id"], row["page"] - radius, row["page"] + radius, limit),
         ).fetchall()
-        return [dict(item) for item in rows]
+        return [self._absolutise(dict(item)) or {} for item in rows]
 
     def answer_question(self, question: str, limit: int = 6, book: int | str | None = None) -> dict:
         """Create a citation-first evidence pack for an exam question.
@@ -1027,7 +1103,7 @@ class Library:
             "plan": plan.as_dict(),
             "evidence": evidence,
             "answer_guidance": guidance,
-            "citation_rule": "引用《书名》、原书页码、章节和 chunk_id；不得把未检索到的内容说成教材结论。",
+            "citation_rule": "引用《书名》、原书页码和章节；不得把未检索到的内容说成教材结论。",
         }
         if scope:
             result["book_scope"] = scope
@@ -1091,5 +1167,5 @@ class Library:
             "SELECT c.*,b.title AS book,b.path FROM chunks c JOIN books b ON b.id=c.book_id WHERE c.chunk_id=?",
             (chunk_id,),
         ).fetchone()
-        return dict(row) if row else None
+        return self._absolutise(dict(row)) if row else None
 

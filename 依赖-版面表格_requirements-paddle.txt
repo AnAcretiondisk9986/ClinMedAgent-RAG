@@ -6,7 +6,7 @@
 # 版面环境是两套解释器，由 pipeline.py 分别调用。
 #
 #   py -3.12 -m venv .venv-ocr312
-#   .venv-ocr312\Scripts\pip install -r requirements-core.txt -r requirements-paddle.txt
+#   .venv-ocr312\Scripts\pip install -r 依赖-核心_requirements-core.txt -r 依赖-版面表格_requirements-paddle.txt
 #
 # GPU 说明：下面这组是本机实测可用的组合（paddle 自报 CUDA 12.9 / cuDNN 9.9.0，
 # GPU：NVIDIA RTX 5070 Laptop）。CUDA/cuDNN 不匹配时 paddle 会回退 CPU，

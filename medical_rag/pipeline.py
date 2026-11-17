@@ -303,7 +303,7 @@ def _check_prerequisites(ctx: PipelineContext, stage: str) -> None:
     if stage == "text":
         if not ctx.pdf.exists():
             raise FileNotFoundError(f"PDF 不存在：{ctx.pdf}")
-        info = cached_analyze(ctx.pdf, ctx.root / ".medical_rag" / "pdf_text")
+        info = cached_analyze(ctx.pdf, ctx.root / ".medical_rag" / "pdf_text", root=ctx.root)
         if info.get("kind") != "text":
             raise RuntimeError(
                 f"该 PDF 没有可用的文字层（{kind_label(info.get('kind'))}，"
@@ -418,6 +418,7 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
     )
     task.attach_process(process)
     tables_total = len(table_pages(ctx))
+    recent_output: list[str] = []
     try:
         assert process.stdout is not None
         for raw_line in process.stdout:
@@ -426,6 +427,11 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
             line = raw_line.rstrip()
             if line:
                 task.log(line)
+                recent_output.append(line)
+                # Keep enough context to explain a failed subprocess without
+                # allowing one noisy OCR run to inflate the task error forever.
+                if len(recent_output) > 20:
+                    del recent_output[:-20]
             update = _progress_from_line(ctx, stage, line, tables_total)
             if update is not None:
                 done, total, message = update
@@ -445,7 +451,11 @@ def run_stage(task: Task, ctx: PipelineContext, stage: str, force: bool = False)
     if task.cancelled:
         raise TaskCancelled()
     if code != 0:
-        raise RuntimeError(f"{STAGE_LABELS[stage]}失败（退出码 {code}），详见日志")
+        detail = "\n".join(recent_output[-12:])
+        suffix = f"\n最近输出：\n{detail}" if detail else "\n子进程没有输出；请检查处理解释器、PDF 路径和写入权限。"
+        raise RuntimeError(
+            f"{STAGE_LABELS[stage]}失败（退出码 {code}）。{suffix}"
+        )
     task.finish_stage()
 
 
@@ -565,7 +575,7 @@ def _log_pdf_kind(task: Task, root: Path, pdf: Path) -> dict[str, Any] | None:
     目录不可写）只记录告警，不影响导入结果。
     """
     try:
-        info = cached_analyze(pdf, root / ".medical_rag" / "pdf_text")
+        info = cached_analyze(pdf, root / ".medical_rag" / "pdf_text", root=root)
     except Exception as exc:  # noqa: BLE001 - 已确认是有效 PDF，检测失败不阻断导入
         task.log(f"警告：PDF 文字层检测失败（文件本身有效）：{exc}")
         return None

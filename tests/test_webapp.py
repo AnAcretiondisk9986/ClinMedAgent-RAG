@@ -657,6 +657,35 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
 
+class RemotePathGuardTests(unittest.TestCase):
+    def test_remote_mode_rejects_server_local_import_and_inspect(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_remote_guard_"))
+        server = create_server("0.0.0.0", 0, root=tmp, token="secret")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            def request(path: str, payload: dict) -> int:
+                body = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    base + path,
+                    data=body,
+                    method="POST",
+                    headers={"Content-Type": "application/json", "X-Auth-Token": "secret"},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        return response.status
+                except urllib.error.HTTPError as error:
+                    return error.code
+
+            self.assertEqual(request("/api/import", {"path": str(tmp / "secret.pdf")}), 403)
+            self.assertEqual(request("/api/inspect", {"path": str(tmp / "secret.pdf")}), 403)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class LoopbackGuardTests(unittest.TestCase):
     def test_is_loopback(self) -> None:
         for host in ("127.0.0.1", "::1", "localhost", "localhost.", "127.0.0.5"):

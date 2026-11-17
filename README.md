@@ -14,6 +14,7 @@
 - **候选重排**：支持标题匹配、章节集中度、内容类型降权和可选向量重排。
 - **多种接入方式**：本地 Web 工作台、命令行、MCP Server、JSON Lines Bridge。
 - **安全默认值**：默认仅监听 loopback；远程监听需要显式开启并使用访问令牌。
+- **可整体移动**：索引里只存相对项目根目录的路径，项目目录改名、换盘、复制一份到别处后，书库与检索都不需要重做（详见[文件说明](文件说明_FILE-MAP.md)）。
 - **可诊断可维护**：提供 `doctor` 环境检查、索引修复和 SQLite 压缩命令。
 
 ## 系统要求
@@ -31,7 +32,7 @@
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
-python -m pip install -r requirements-core.txt
+python -m pip install -r 依赖-核心_requirements-core.txt
 ```
 
 或安装项目本身：
@@ -49,7 +50,7 @@ OCR 依赖建议单独安装：
 ```powershell
 python -m venv .venv-ocr
 .venv-ocr\Scripts\activate
-python -m pip install -r requirements-core.txt -r requirements-ocr.txt
+python -m pip install -r 依赖-核心_requirements-core.txt -r 依赖-OCR识别_requirements-ocr.txt
 ```
 
 ### 安装 Paddle 版面 / 表格环境
@@ -59,7 +60,7 @@ Paddle 相关依赖与 Python、CUDA/cuDNN 强相关，建议使用 Python 3.12�
 ```powershell
 py -3.12 -m venv .venv-ocr312
 .venv-ocr312\Scripts\activate
-python -m pip install -r requirements-core.txt -r requirements-paddle.txt
+python -m pip install -r 依赖-核心_requirements-core.txt -r 依赖-版面表格_requirements-paddle.txt
 ```
 
 不同机器的 CUDA、驱动和 GPU provider 可能不同，请以本机环境为准。
@@ -78,11 +79,13 @@ python -m medical_rag.webapp
 http://127.0.0.1:17173/
 ```
 
-Windows 也可以运行：
+Windows 也可以直接双击或运行：
 
 ```powershell
-scripts\start_web.bat
+.\启动网页工作台_Start-Web.bat
 ```
+
+（内部真正启动服务的是 `scripts\start_web.bat`，根目录这个文件只负责找 Python 并转发参数。）
 
 常用参数：
 
@@ -164,6 +167,7 @@ medical-rag doctor --compact
 ```
 
 `--repair` 和 `--compact` 会修改索引数据库，请确保数据库目录可写，并在重要数据上提前备份。
+索引里记录的是相对项目根目录的路径，项目目录被移动/改名后打开库会自动迁移，通常不需要手工改库。
 
 ## Agent 接入
 
@@ -175,8 +179,10 @@ medical-rag doctor --compact
 [mcp_servers.medical-books]
 command = "python"
 args = ["-m", "medical_rag.mcp_server"]
-cwd = "F:\\AI Agent检索知识库"
+cwd = "D:\\你的项目目录\\ClinMedAgent-RAG"
 ```
+
+`cwd` 要写成你本机项目实际所在目录；项目移动过就把这里一起改。
 
 主要工具：
 
@@ -213,15 +219,36 @@ medical-rag-bridge
 
 ```text
 .medical_rag/
-├── library.sqlite3       # 本地索引数据库
+├── library.sqlite3       # 本地索引数据库（教材路径按“相对项目根目录”保存）
 ├── pdf_text/             # 文字层检测缓存
 └── web_cache/             # Web 预览缓存
 
-.build/                   # 渲染、测试和构建缓存
-res/                      # 教材 PDF 与流水线产物
+.build/                   # 渲染、测试和构建缓存（可随时删除）
+res/                      # 教材 PDF 与流水线产物（索引指向这里）
+output/                   # 生成好的 PDF 等交付物（可选，不参与运行）
 ```
 
 上述本地数据默认不纳入 Git。请勿将包含教材 PDF 或敏感资料的目录提交到公共仓库。
+
+逐项用途（中英文对照）见 [文件说明_FILE-MAP.md](文件说明_FILE-MAP.md)。
+
+## 移动 / 备份 / 换机
+
+本项目按"整个目录可以随便搬"设计：
+
+1. **同一台电脑换目录、换盘、改名**：直接复制或移动整个文件夹即可。索引库只记相对路径，
+   第一次打开时会自动把老绝对路径迁移过来，书卡、按书检索、页码正文、预览缓存都不受影响。
+2. **复制一份做备份/试验**：两份副本各自用自己的 `res/` 与 `.medical_rag/`，互不干扰（不会再指向原来那份）。
+3. **换电脑**：`res/`、`.medical_rag/`、源码可以直接带走；但 `.venv-ocr` 与 `.venv-ocr312`
+   里的 `python.exe` 只是"引导器"，它依赖写死的基础 Python（如 `C:\Python314`、当前用户目录下的 Python 3.12），
+   换机后必然失效——用 `scripts\重建虚拟环境_Rebuild-Venvs.bat` 重建即可（约 10 GB，重建需联网下载依赖）。
+4. **路径长度**：`res/` 下已有接近 200 字符的长路径，新位置建议控制在整个项目根目录不超过 60 个字符，
+   避免撞 Windows 260 字符上限。
+5. **改名后检查**：`python -m medical_rag.cli doctor` 的「索引路径」与「索引时效性」两项应为 ok；
+   MCP 客户端配置里的 `cwd`、快捷方式里的路径也要跟着改。
+
+移动之后如果 `doctor` 报「N 本教材的索引路径找不到」，说明 `res/` 下对应目录被删或改名了，
+按提示重建该教材索引即可。
 
 ## 检索实现概览
 
@@ -237,6 +264,12 @@ res/                      # 教材 PDF 与流水线产物
 
 ```powershell
 python -m pytest -q
+```
+
+其中一个专门的回归测试会真的把假项目目录搬到新路径，验证索引、按书检索与重建索引仍然正常：
+
+```powershell
+python -m pytest tests/test_relocation.py -q
 ```
 
 JavaScript 前端语法检查：

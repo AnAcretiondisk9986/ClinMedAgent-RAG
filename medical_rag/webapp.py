@@ -155,12 +155,20 @@ def render_page_png(app: "WebApp", book: dict[str, Any], page_no: int, width: in
 class WebApp:
     """站点状态：教材扫描缓存、任务管理器、渲染锁。"""
 
-    def __init__(self, root: Path | str = DEFAULT_ROOT, db: Path | str | None = None, token: str = ""):
+    def __init__(
+        self,
+        root: Path | str = DEFAULT_ROOT,
+        db: Path | str | None = None,
+        token: str = "",
+        allow_local_paths: bool = True,
+    ):
         self.root = Path(root).expanduser().resolve()
         self.db = Path(db).expanduser().resolve() if db else self.root / ".medical_rag" / "library.sqlite3"
         self.cache_dir = self.root / ".medical_rag" / "web_cache"
         # 非空时启用访问令牌（非本机监听必须启用；本机监听默认为空 = 不鉴权）
         self.token = str(token or "")
+        self.allow_local_paths = bool(allow_local_paths)
+        self.asset_cache = "private, max-age=86400" if self.token else "public, max-age=86400"
         self.tasks = TaskManager()
         self.render_lock = threading.Lock()
         self._books_lock = threading.Lock()
@@ -184,7 +192,7 @@ class WebApp:
         return next((book for book in self.books() if book["id"] == book_id), None)
 
     def library(self) -> Library:
-        return Library(self.db)
+        return Library(self.db, root=self.root)
 
     def overview(self, port: int | None = None) -> dict[str, Any]:
         from .embeddings import create_backend_cached
@@ -399,14 +407,14 @@ class Handler(BaseHTTPRequestHandler):
             if rest == ["cover.png"] or rest == ["cover"]:
                 width = _int_arg(query, "w", 480)
                 path = render_page_png(self.app, book, 1, width)
-                return self._send_file(path, "image/png", cache="public, max-age=86400")
+                return self._send_file(path, "image/png", cache=self.app.asset_cache)
             if rest == ["pdf"]:
                 return self._serve_pdf(Path(book["pdf"]))
             if len(rest) == 2 and rest[0] == "page":
                 page_no = int(rest[1].split(".")[0])
                 width = _int_arg(query, "w", 1500)
                 path = render_page_png(self.app, book, page_no, width)
-                return self._send_file(path, "image/png", cache="public, max-age=86400")
+                return self._send_file(path, "image/png", cache=self.app.asset_cache)
             if len(rest) == 2 and rest[0] == "text":
                 page_no = int(rest[1].split(".")[0])
                 return self._send_data(self._page_text(book, page_no))
@@ -460,6 +468,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         filename = urllib.parse.quote(pdf.name)
         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{filename}")
+        self.send_header("Cache-Control", "private, no-store" if self.app.token else "no-store")
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -538,6 +547,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _post_import(self) -> None:
         body = self._read_json()
+        if not self.app.allow_local_paths:
+            return self._send_error_json(403, "远程模式只允许上传 PDF，不允许读取服务端本地路径")
         source = str(body.get("path") or "").strip()
         if not source:
             return self._send_error_json(400, "请填写 PDF 路径")
@@ -607,6 +618,8 @@ class Handler(BaseHTTPRequestHandler):
     def _post_inspect(self) -> None:
         """导入前检测 PDF 是否带文字层（供导入弹窗使用）。"""
         body = self._read_json()
+        if not self.app.allow_local_paths:
+            return self._send_error_json(403, "远程模式只允许上传 PDF，不允许读取服务端本地路径")
         path_text = str(body.get("path") or "").strip()
         if not path_text:
             return self._send_error_json(400, "请填写 PDF 路径")
@@ -615,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json(400, f"文件不存在：{pdf}")
         if pdf.is_dir() or pdf.suffix.lower() != ".pdf":
             return self._send_error_json(400, "请填写 PDF 文件路径")
-        info = cached_analyze(pdf, self.app.root / ".medical_rag" / "pdf_text")
+        info = cached_analyze(pdf, self.app.root / ".medical_rag" / "pdf_text", root=self.app.root)
         if info.get("error"):
             return self._send_error_json(400, str(info["error"]))
         text_kind = info.get("kind")
@@ -827,7 +840,7 @@ class Handler(BaseHTTPRequestHandler):
             task.mark_error(str(exc))
             raise
         try:
-            info = cached_analyze(target, self.app.root / ".medical_rag" / "pdf_text")
+            info = cached_analyze(target, self.app.root / ".medical_rag" / "pdf_text", root=self.app.root)
             task.log(
                 f"PDF 检测：{kind_label(info.get('kind'))}，"
                 f"{info.get('text_pages', 0)}/{info.get('pages', 0)} 页有文字，共 {info.get('chars', 0)} 字"
@@ -875,7 +888,7 @@ def create_server(
     port_attempts: int = 20,
     token: str = "",
 ) -> MedicalHTTPServer:
-    app = WebApp(root, db, token=token)
+    app = WebApp(root, db, token=token, allow_local_paths=is_loopback(host))
     last_error: OSError | None = None
     for offset in range(port_attempts):
         try:

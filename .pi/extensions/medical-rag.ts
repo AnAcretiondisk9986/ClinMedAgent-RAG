@@ -185,13 +185,7 @@ interface EvidenceItem {
 
 function formatEvidence(item: EvidenceItem, index?: number): string {
 	const prefix = index === undefined ? "" : `[${index}] `;
-	const scores = [
-		item.score !== undefined ? `score=${item.score}` : undefined,
-		item.retrieval_score !== undefined ? `retrieval_score=${item.retrieval_score}` : undefined,
-	]
-		.filter(Boolean)
-		.join(" · ");
-	return `${prefix}《${item.book}》第${item.page}页 · ${item.section}${scores ? ` · ${scores}` : ""}\n${item.text}\nchunk_id=${item.chunk_id}`;
+	return `${prefix}依据《${item.book}》原书第 ${item.page} 页（${item.section}）\n${item.text}`;
 }
 
 function formatEvidenceList(items: EvidenceItem[]): string {
@@ -214,7 +208,7 @@ function formatAnswer(data: Record<string, unknown>): string {
 		lines.push(`检索式：${plan.queries.map((query) => JSON.stringify(query)).join(" → ")}`);
 	}
 	if (data.answer_guidance) lines.push(`作答提示：${data.answer_guidance}`);
-	if (data.citation_rule) lines.push(`引用规则：${data.citation_rule}`);
+	lines.push("引用规则：引用《书名》、原书页码和章节；证据不足时明确说明。");
 	lines.push("");
 	lines.push(evidence.length ? "证据：" : "证据：本地教材知识库没有检索到证据。");
 	for (const [index, item] of evidence.entries()) {
@@ -247,7 +241,7 @@ export default function medicalRagExtension(pi: ExtensionAPI) {
 	const guidelines = [
 		"Use medical_answer_question for Chinese medical/anatomy exam questions and medical_search_books for focused lookups before answering from memory.",
 		"Pass book (id, title or abbreviation like 组胚) to limit a search to one textbook; medical_answer_question automatically scopes to a textbook named in the question and reports it as book_scope.",
-		"Cite 《书名》、原书页码、章节和 chunk_id from medical_* tool results. Pages are calibrated printed book pages (原书页码) and can be checked directly in the physical book. If a medical_* tool returns no evidence, say the local library has no supporting evidence instead of inventing textbook support.",
+		"Cite 《书名》、原书页码和章节 from medical_* tool results. Internal evidence identifiers are for tool chaining only and must not appear in the user-facing answer. If a medical_* tool returns no evidence, say the local library has no supporting evidence instead of inventing textbook support.",
 	];
 
 	pi.registerTool({
@@ -270,7 +264,7 @@ export default function medicalRagExtension(pi: ExtensionAPI) {
 		name: "medical_search_books",
 		label: "Medical: Search Books",
 		description:
-			"只在本地医学教材中检索证据。每条结果含书名、页码、章节、原文和稳定 chunk_id；无结果时不得声称教材支持某个答案。可用 book 限定教材。",
+			"只在本地医学教材中检索证据。每条结果含书名、原书页码、章节和原文；内部定位标识仅供工具链调用。无结果时不得声称教材支持某个答案。可用 book 限定教材。",
 		promptSnippet: "Search local medical textbooks for citation-first evidence",
 		promptGuidelines: guidelines,
 		parameters: Type.Object({

@@ -115,8 +115,18 @@ def analyze(pdf: Path | str) -> dict[str, Any]:
     }
 
 
-def cached_analyze(pdf: Path | str, cache_dir: Path | str) -> dict[str, Any]:
-    """带缓存的检测结果；PDF 修改后自动失效。"""
+def cached_analyze(
+    pdf: Path | str,
+    cache_dir: Path | str,
+    root: Path | str | None = None,
+) -> dict[str, Any]:
+    """带缓存的检测结果；PDF 修改后自动失效。
+
+    ``root`` 给出时缓存键用"项目内相对路径"，整个目录移动/复制后缓存依然命中；
+    不传则退回绝对路径（老行为，兼容外部调用）。
+    """
+    from .paths import store_path
+
     pdf = Path(pdf)
     cache = Path(cache_dir)
     try:
@@ -125,17 +135,24 @@ def cached_analyze(pdf: Path | str, cache_dir: Path | str) -> dict[str, Any]:
     except OSError:
         return {"kind": "scan", "pages": 0, "text_pages": 0, "chars": 0, "error": "PDF 不可读"}
 
-    key = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:16]
+    key_source = store_path(root, resolved) if root is not None else resolved
+    key = hashlib.sha1(key_source.encode("utf-8")).hexdigest()[:16]
     cache_file = cache / f"{key}.json"
     if cache_file.exists():
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
-            if str(data.get("pdf")) == resolved and abs(float(data.get("mtime", -1)) - mtime) < 1e-6:
+            same_mtime = abs(float(data.get("mtime", -1)) - mtime) < 1e-6
+            cached_key = data.get("cache_key")
+            if same_mtime and (
+                cached_key == key
+                or (cached_key is None and str(data.get("pdf")) == resolved)  # 旧格式缓存
+            ):
                 return data
         except (OSError, ValueError, TypeError):
             pass
 
     data = analyze(pdf)
+    data["cache_key"] = key
     try:
         cache.mkdir(parents=True, exist_ok=True)
         temp = cache_file.with_suffix(".tmp")

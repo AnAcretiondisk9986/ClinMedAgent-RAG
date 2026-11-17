@@ -71,6 +71,13 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
 }
 
+function citationFor(item) {
+  const book = item.book || state.selected?.index_title || state.selected?.title || "教材";
+  const page = item.page ?? item.printed ?? "?";
+  const section = item.section || "未标注章节";
+  return `依据《${book}》原书第 ${page} 页（${section}）`;
+}
+
 function formatBytes(size) {
   const value = Number(size) || 0;
   if (value < 1024) return `${value} B`;
@@ -553,11 +560,10 @@ async function loadPageText(printed) {
         <div class="text-chunk">
           <div class="section">${escapeHtml(chunk.section || "未标注章节")}</div>
           <div class="body">${escapeHtml(chunk.text)}</div>
-          <div class="chunk-id" data-chunk="${escapeHtml(chunk.chunk_id)}">chunk_id=${escapeHtml(chunk.chunk_id)}</div>
+          <div class="citation">${escapeHtml(citationFor({ book: state.selected?.index_title || state.selected?.title, page: printed, section: chunk.section }))}</div>
         </div>`,
       )
       .join("");
-    $$(".chunk-id", box).forEach((element) => element.addEventListener("click", () => copyText(element.dataset.chunk, "已复制 chunk_id")));
   } catch (error) {
     if (requestId === state.textRequest) box.innerHTML = `<div class="empty">文本加载失败：${escapeHtml(error.message)}</div>`;
   }
@@ -618,9 +624,9 @@ function renderSearchResults(data) {
         <button class="btn small" data-open>打开该页</button>
       </div>
       <div class="text">${escapeHtml(item.text)}</div>
-      <div class="foot"><span class="chunk" data-chunk="${escapeHtml(item.chunk_id)}">chunk_id=${escapeHtml(item.chunk_id)}</span></div>`;
+      <div class="foot"><button class="citation-copy" data-copy-citation>${escapeHtml(citationFor(item))}</button></div>`;
     card.querySelector("[data-open]").addEventListener("click", () => openSearchResult(item));
-    card.querySelector("[data-chunk]").addEventListener("click", () => copyText(item.chunk_id, "已复制 chunk_id"));
+    card.querySelector("[data-copy-citation]").addEventListener("click", () => copyText(citationFor(item), "已复制引用"));
     list.appendChild(card);
   }
 }

@@ -95,8 +95,8 @@ def _dispatch(args: argparse.Namespace, library: Library) -> None:
         print(library.ingest(args.pdf, args.title))
     elif args.command == "search":
         for item in library.search(args.query, args.limit, book=getattr(args, "book", None)):
-            score = f" · score={item['score']}" if item.get('score') is not None else ""
-            print(f"[{item['book']} · 第{item['page']}页 · {item['section']}{score}]\n{item['text']}\nchunk_id={item['chunk_id']}\n")
+            citation = f"依据《{item['book']}》原书第 {item['page']} 页（{item['section']}）"
+            print(f"{citation}\n{item['text']}\n")
     elif args.command == "answer":
         result = library.answer_question(args.question, args.limit, book=getattr(args, "book", None))
         if args.json:
@@ -112,7 +112,8 @@ def _dispatch(args: argparse.Namespace, library: Library) -> None:
             if not result.get("evidence"):
                 print("知识库没有检索到足够证据。")
             for item in result.get("evidence", []):
-                print(f"[{item['book']} · 第{item['page']}页 · {item['section']} · score={item['retrieval_score']}]\n{item['text']}\nchunk_id={item['chunk_id']}\n")
+                citation = f"依据《{item['book']}》原书第 {item['page']} 页（{item['section']}）"
+                print(f"{citation}\n{item['text']}\n")
     elif args.command == "ingest-text":
         print(library.ingest_markdown_tree(args.directory, args.title))
     elif args.command == "list":

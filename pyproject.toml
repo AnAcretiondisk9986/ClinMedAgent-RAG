@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clinmedagent-rag"
-version = "0.3.0"
+version = "0.4.0"
 description = "本地医学教材 RAG：引用优先的教材证据检索，面向 Agent 平台"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ classifiers = [
   "Topic :: Text Processing :: Indexing",
 ]
 # 只声明核心依赖；OCR / 版面 / 表格是分属不同 Python 环境的可选流水线，
-# 版本矩阵见 README，安装用 requirements-ocr.txt / requirements-paddle.txt
+# 版本矩阵见 README，安装用 依赖-OCR识别_requirements-ocr.txt / 依赖-版面表格_requirements-paddle.txt
 # （刻意不做成 pip extras：这些 GPU 轮子按 CUDA 版本匹配，写成 extras 会与实际不符）
 dependencies = ["PyMuPDF>=1.24"]
 

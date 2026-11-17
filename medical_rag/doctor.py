@@ -24,8 +24,9 @@ MIN_PYTHON = (3, 10)
 CORE_PACKAGES = ("PyMuPDF",)
 OCR_PACKAGES = ("rapidocr", "onnxruntime-gpu", "opencv-python", "numpy", "pillow", "shapely", "pyclipper")
 PADDLE_PACKAGES = ("paddlepaddle-gpu", "paddleocr", "paddlex")
-OCR_REQUIREMENTS = "requirements-ocr.txt"
-PADDLE_REQUIREMENTS = "requirements-paddle.txt"
+OCR_REQUIREMENTS = "依赖-OCR识别_requirements-ocr.txt"
+PADDLE_REQUIREMENTS = "依赖-版面表格_requirements-paddle.txt"
+CORE_REQUIREMENTS = "依赖-核心_requirements-core.txt"
 DEEP_TIMEOUT = 180
 
 
@@ -121,9 +122,14 @@ def _package_check(
 def _probe_import(python: str, modules: tuple[str, ...]) -> tuple[bool, str]:
     """在指定解释器里真实 import 一次（deep 模式用）。"""
     code = (
-        "import importlib,sys\n"
+        "import sys\n"
         f"mods={list(modules)!r}\n"
-        "bad=[m for m in mods if importlib.util.find_spec(m) is None]\n"
+        "bad=[]\n"
+        "for m in mods:\n"
+        "    try:\n"
+        "        __import__(m)\n"
+        "    except Exception as exc:\n"
+        "        bad.append(f\"{m} ({type(exc).__name__}: {exc})\")\n"
         "print('MISSING:'+','.join(bad) if bad else 'OK')\n"
     )
     try:
@@ -146,7 +152,9 @@ def _probe_import(python: str, modules: tuple[str, ...]) -> tuple[bool, str]:
     return False, last[8:] if last.startswith("MISSING:") else last
 
 
-def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
+def _database_report(
+    db_path: Path, root: Path | str | None = None
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
     if not db_path.exists():
         return (
             {"path": str(db_path), "exists": False},
@@ -154,8 +162,9 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
         )
     from .library import Library
 
+    base = Path(root).expanduser().resolve() if root else db_path.parent.parent
     try:
-        library = Library(db_path)
+        library = Library(db_path, root=base)
     except Exception as exc:  # noqa: BLE001 - 打不开就是 error
         return (
             {"path": str(db_path), "exists": True, "error": str(exc)},
@@ -166,12 +175,22 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
         chunks = int(library.cx.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         integrity = library.fts_integrity_ok()
         stale = library.stale_books()
+        # 库里实际保存的写法（相对/绝对）：用于提示“这份索引能不能跟着目录搬走”
+        raw_paths = [row["path"] for row in library.cx.execute("SELECT path FROM books")]
+        relative_paths = sum(1 for value in raw_paths if value and not Path(value).is_absolute())
+        missing_books = [
+            book["title"]
+            for book in books
+            if book.get("path") and not Path(book["path"]).exists()
+        ]
         report = {
             "path": str(db_path),
             "exists": True,
             "books": len(books),
             "chunks": chunks,
             "fts_integrity": integrity,
+            "relative_paths": relative_paths,
+            "missing_books": missing_books,
             "embedding_backend": getattr(library, "embedding", None) and library.embedding.name,
             "embedding_warning": getattr(library, "embedding_warning", ""),
             "stale_books": [
@@ -181,6 +200,16 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
         }
     finally:
         library.close()
+    if not raw_paths:
+        path_status, path_detail, path_hint = "warn", "索引库还没有教材记录", "先导入并处理一本教材"
+    elif missing_books:
+        path_status = "warn"
+        path_detail = f"{len(missing_books)} 本教材的索引路径找不到：" + "、".join(missing_books[:3])
+        path_hint = "确认 res/ 下教材目录还在；目录改过名就重新建立索引"
+    else:
+        path_status = "ok"
+        path_detail = f"{relative_paths}/{len(raw_paths)} 本用相对路径保存，可随目录整体搬走"
+        path_hint = ""
     checks = [
         _check(
             "索引库",
@@ -208,6 +237,7 @@ def _database_report(db_path: Path) -> tuple[dict[str, Any], list[dict[str, str]
             f"{len(stale)} 本教材的索引可能过期" if stale else "索引与源 PDF 一致",
             "；".join(f"{item.get('title')}：{item.get('reason')}" for item in stale[:3]) if stale else "",
         ),
+        _check("索引路径", path_status, path_detail, path_hint),
     ]
     return report, checks
 
@@ -228,6 +258,41 @@ def _workspace_report(root: Path) -> tuple[dict[str, Any], list[dict[str, str]]]
         return report, [_check("工作区", "warn", f"没有 {res_dir}，尚未导入任何教材")]
     return report, [
         _check("工作区", "ok", f"{len(book_dirs)} 个教材目录，其中 {len(with_pdf)} 个含 PDF")
+    ]
+
+
+def _output_access_check(root: Path) -> list[dict[str, str]]:
+    """检查各教材 ``processed_v3`` 下的产物当前账号能不能动。
+
+    Windows 上被别的安全上下文（其它账号、沙箱/Agent 环境）写过的产物会留下
+    文件名但拒绝一切访问（读、改名、删除全部 ERROR_ACCESS_DENIED）。这种状态下
+    生成流水线会在“把旧产物挪进备份”第一步就失败，且关掉资源管理器/预览器也
+    没用；提前在自检里报出来，比等跑到一半失败好。
+    """
+    from .outputs import blocked_outputs
+
+    res_dir = root / "res"
+    if not res_dir.is_dir():
+        return []
+    problems: list[str] = []
+    for book_dir in sorted(path for path in res_dir.iterdir() if path.is_dir()):
+        target = book_dir / "processed_v3"
+        if not target.is_dir():
+            continue
+        blocked = blocked_outputs(target)
+        if blocked:
+            problems.append(f"{book_dir.name}：{'、'.join(blocked)}")
+    if not problems:
+        return [_check("产物权限", "ok", "processed_v3 下的产物读写正常")]
+    return [
+        _check(
+            "产物权限",
+            "warn",
+            f"{'；'.join(problems)} 拒绝访问（名字还在，但读/改名/删除都被拒绝）",
+            "这些产物只能换掉不能覆盖：先试管理员 takeown /f \"<processed_v3>\" /r /d y 再 "
+            "icacls \"<processed_v3>\" /reset /t /c /q；不需要旧产物的话，直接把 processed_v3 "
+            "改名搁置（例如 processed_v3.broken），再重新生成即可",
+        )
     ]
 
 
@@ -255,7 +320,7 @@ def check_environment(
             f"{sys.version.split()[0]}（需要 >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]}）",
         )
     )
-    checks.append(_package_check("核心依赖", CORE_PACKAGES, "requirements-core.txt", "核心依赖缺失"))
+    checks.append(_package_check("核心依赖", CORE_PACKAGES, CORE_REQUIREMENTS, "核心依赖缺失"))
     interpreters = interpreter_info(root)
     if interpreters["venv_ocr"]:
         checks.append(_check("OCR 解释器", "ok", interpreters["ocr_python"]))
@@ -277,6 +342,26 @@ def check_environment(
                 "warn",
                 f"未找到 .venv-ocr312，回退到 {interpreters['paddle_python']}",
                 f"版面/表格需要：python -m venv .venv-ocr312 && pip install -r {PADDLE_REQUIREMENTS}",
+            )
+        )
+
+    # 目录被移动/换电脑后，venv 里的 python.exe 只是引导器：它按 pyvenv.cfg 里
+    # 写死的基础 Python（如 C:\Python314）启动。这里真跑一次，比只看文件存在可靠。
+    for flag, key, label, folder in (
+        ("venv_ocr", "ocr_python", "OCR 解释器可运行", ".venv-ocr"),
+        ("venv_ocr312", "paddle_python", "Paddle 解释器可运行", ".venv-ocr312"),
+    ):
+        if not interpreters[flag]:
+            continue
+        runnable, detail = _probe_import(interpreters[key], ())
+        checks.append(
+            _check(
+                label,
+                "ok" if runnable else "error",
+                interpreters[key] if runnable else f"{folder} 无法启动：{detail}",
+                ""
+                if runnable
+                else f"{folder} 依赖写死的基础 Python，换电脑/换用户后必须重建（见 README 或 scripts\\重建虚拟环境_Rebuild-Venvs.bat）",
             )
         )
 
@@ -318,10 +403,11 @@ def check_environment(
                 )
             )
 
-    database, db_checks = _database_report(db_path)
+    database, db_checks = _database_report(db_path, root)
     workspace, ws_checks = _workspace_report(root)
     checks.extend(db_checks)
     checks.extend(ws_checks)
+    checks.extend(_output_access_check(root))
 
     errors = sum(1 for item in checks if item["status"] == "error")
     warnings = sum(1 for item in checks if item["status"] == "warn")
@@ -361,7 +447,7 @@ def repair(root: Path | str | None = DEFAULT_ROOT, db: Path | str | None = None)
     _, db_path = _resolve_paths(root, db)
     if not db_path.exists():
         return {"repaired": False, "reason": f"索引库不存在：{db_path}"}
-    library = Library(db_path)
+    library = Library(db_path, root=_resolve_paths(root, db)[0])
     try:
         before = library.fts_integrity_ok()
         chunks = library.rebuild_fts_index()
@@ -386,7 +472,7 @@ def compact(root: Path | str | None = DEFAULT_ROOT, db: Path | str | None = None
     if not db_path.exists():
         return {"compacted": False, "reason": f"索引库不存在：{db_path}"}
     before = db_path.stat().st_size
-    library = Library(db_path)
+    library = Library(db_path, root=_resolve_paths(root, db)[0])
     try:
         # WAL 里的内容要先落盘，VACUUM 看到的才是最终大小
         library.cx.execute("PRAGMA wal_checkpoint(TRUNCATE)")

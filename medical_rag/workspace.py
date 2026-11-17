@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from .library import DEFAULT_DB
+from .paths import absolute_path, relative_key, root_for_db
 from .pdftext import cached_analyze
 
 PDF_PAGE_CACHE: dict[tuple[str, float], int] = {}
@@ -85,11 +87,16 @@ def _read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def load_db_books(db: Path | str = DEFAULT_DB) -> list[dict]:
-    """读取索引库里的书籍记录；库不存在时返回空列表。"""
+def load_db_books(db: Path | str = DEFAULT_DB, root: Path | str | None = None) -> list[dict]:
+    """读取索引库里的书籍记录；库不存在时返回空列表。
+
+    索引库里存的是相对项目根目录的路径（见 :mod:`medical_rag.paths`），这里统一
+    还原成当前根目录下的绝对路径，调用方不必关心"项目被移动过"这件事。
+    """
     db_path = Path(db).expanduser()
     if not db_path.exists():
         return []
+    base = Path(root).expanduser().resolve() if root else root_for_db(db_path)
     try:
         connection = sqlite3.connect(db_path)
         connection.row_factory = sqlite3.Row
@@ -104,6 +111,11 @@ def load_db_books(db: Path | str = DEFAULT_DB) -> list[dict]:
             books = []
             for row in rows:
                 item = dict(row)
+                for column in ("path", "source_path", "quality_path"):
+                    if item.get(column):
+                        resolved = absolute_path(base, item[column])
+                        if resolved is not None:
+                            item[column] = str(resolved)
                 chunks, chunk_pages = stats.get(row["id"], (0, 0))
                 item["chunks"] = chunks
                 item["chunk_pages"] = chunk_pages
@@ -115,19 +127,32 @@ def load_db_books(db: Path | str = DEFAULT_DB) -> list[dict]:
         return []
 
 
-def _match_db_book(db_books: list[dict], book_dir: Path) -> dict | None:
-    """找出属于该教材目录的索引记录（processed_v3 或其他子目录）。"""
+def _match_db_book(
+    db_books: list[dict], book_dir: Path, root: Path | None = None
+) -> dict | None:
+    """找出属于该教材目录的索引记录（processed_v3 或其他子目录）。
+
+    先比绝对路径；再比"相对项目根目录"的位置——这样整个目录被移动/复制后，
+    库里没来得及迁移的老绝对路径也依然能对上当前教材目录。
+    """
     book_dir = book_dir.resolve()
-    best: dict | None = None
+    book_key = relative_key(root, book_dir) if root else os.path.normcase(str(book_dir))
     for item in db_books:
-        try:
-            path = Path(item["path"]).expanduser().resolve()
-        except (OSError, ValueError):
+        raw = str(item.get("path") or "")
+        if not raw:
             continue
-        if path == book_dir or book_dir in path.parents:
-            best = item
-            break
-    return best
+        path = Path(raw)
+        if path.is_absolute():
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            if path == book_dir or book_dir in path.parents:
+                return item
+        item_key = relative_key(root, raw) if root else os.path.normcase(raw)
+        if item_key and (item_key == book_key or item_key.startswith(book_key + os.sep)):
+            return item
+    return None
 
 
 def book_state(
@@ -139,13 +164,13 @@ def book_state(
     root = Path(root).resolve()
     book_dir = Path(book_dir).resolve()
     if db_books is None:
-        db_books = load_db_books(root / ".medical_rag" / "library.sqlite3")
+        db_books = load_db_books(root / ".medical_rag" / "library.sqlite3", root=root)
 
     pdf = find_pdf(book_dir)
     text_info: dict[str, Any] | None = None
     if pdf is not None:
         try:
-            text_info = cached_analyze(pdf, root / ".medical_rag" / "pdf_text")
+            text_info = cached_analyze(pdf, root / ".medical_rag" / "pdf_text", root=root)
         except Exception:  # noqa: BLE001 - 检测失败不应影响书库扫描
             text_info = None
     text_dir = book_dir / "text_v3"
@@ -169,7 +194,7 @@ def book_state(
     elif pdf is not None:
         pages = pdf_page_count(pdf)
 
-    db_book = _match_db_book(db_books, book_dir)
+    db_book = _match_db_book(db_books, book_dir, root)
     try:
         rel_dir = book_dir.relative_to(root).as_posix()
     except ValueError:
@@ -278,7 +303,7 @@ def scan_books(root: Path, db: Path | str | None = None) -> list[dict[str, Any]]
     """扫描 res/ 下所有教材目录，并附带索引库中不在 res/ 的记录。"""
     root = Path(root).resolve()
     db_path = Path(db).expanduser() if db else root / ".medical_rag" / "library.sqlite3"
-    db_books = load_db_books(db_path)
+    db_books = load_db_books(db_path, root=root)
     books: list[dict[str, Any]] = []
     seen_rel: set[str] = set()
 
@@ -291,23 +316,35 @@ def scan_books(root: Path, db: Path | str | None = None) -> list[dict[str, Any]]
             books.append(state)
             seen_rel.add(state["rel_dir"])
 
-    # 索引库里有、但 res/ 下没有目录的记录（例如索引指向别处）
+    # 索引库里有、但 res/ 下没有目录的记录（例如教材目录被删了、索引指向别处）
     for item in db_books:
-        path = Path(item["path"]).expanduser()
+        path = Path(str(item.get("path") or "")).expanduser()
+        if not path.is_absolute():
+            path = root / path
         try:
-            rel = path.resolve().relative_to(root).as_posix()
-        except (OSError, ValueError):
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        try:
+            rel: str | None = resolved.relative_to(root).as_posix()
+        except ValueError:
             rel = None
         if rel is not None and rel in seen_rel:
             continue
         if rel is not None and any(rel == b["rel_dir"] or rel.startswith(b["rel_dir"] + "/") for b in books):
             continue
+        # 标题别显示成 processed_v3 / text_v3，用教材目录名更像人话
+        title = (
+            resolved.parent.name
+            if resolved.name in {"processed_v3", "text_v3"}
+            else resolved.stem
+        ) or item.get("title") or "未命名教材"
         books.append(
             {
-                "id": book_id_for(str(path)),
-                "rel_dir": rel or str(path),
+                "id": book_id_for(rel or resolved.as_posix()),
+                "rel_dir": rel or resolved.as_posix(),
                 "dir": None,
-                "title": path.stem,
+                "title": title,
                 "index_title": item["title"],
                 "pdf": None,
                 "workflow": "ocr",

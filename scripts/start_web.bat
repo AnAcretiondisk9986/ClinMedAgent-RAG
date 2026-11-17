@@ -39,7 +39,7 @@ if not defined PYTHON (
 echo.
 echo  正在启动本地医学教材工作台...
 echo  默认地址：http://127.0.0.1:17173/   （启动后会自动打开浏览器）
-echo  关闭本窗口即停止服务；改端口可以传参：start_web.bat --port 18080
+echo  关闭本窗口即停止服务；改端口可以传参：启动网页工作台_Start-Web.bat --port 18080
 echo.
 
 %PYTHON% -X utf8 -m medical_rag.webapp %*

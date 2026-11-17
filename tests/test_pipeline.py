@@ -165,6 +165,38 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--title", command)
 
 
+class StageFailureTests(unittest.TestCase):
+    def test_failed_stage_error_includes_recent_subprocess_output(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="medrag_stage_failure_"))
+        context = make_context(tmp)
+        make_pdf(context.pdf)
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("启动\n致命错误：无法写入输出目录\n")
+                self._code: int | None = None
+
+            def poll(self):
+                return self._code
+
+            def wait(self):
+                self._code = 1
+                return self._code
+
+            def kill(self):
+                self._code = -9
+
+        task = TaskManager().create_manual("process", "失败阶段")
+        with mock.patch.object(pipeline, "_check_prerequisites"):
+            with mock.patch.object(pipeline, "stage_command", return_value=["fake-command"]):
+                with mock.patch.object(pipeline.subprocess, "Popen", return_value=FakeProcess()):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        pipeline.run_stage(task, context, "text")
+        message = str(ctx.exception)
+        self.assertIn("退出码 1", message)
+        self.assertIn("致命错误：无法写入输出目录", message)
+
+
 class ProgressParseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="medrag_prog_"))

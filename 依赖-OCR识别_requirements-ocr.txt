@@ -3,7 +3,7 @@
 # 独立环境（本项目实测 Python 3.14.3，目录 .venv-ocr）：
 #
 #   python -m venv .venv-ocr
-#   .venv-ocr\Scripts\pip install -r requirements-core.txt -r requirements-ocr.txt
+#   .venv-ocr\Scripts\pip install -r 依赖-核心_requirements-core.txt -r 依赖-OCR识别_requirements-ocr.txt
 #
 # GPU 说明：onnxruntime-gpu 需要与本机 CUDA/cuDNN 匹配的版本；下面这组是本机
 # 实测可用的组合（GPU：NVIDIA RTX 5070 Laptop，驱动 596.49，
